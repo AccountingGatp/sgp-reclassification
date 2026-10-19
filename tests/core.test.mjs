@@ -99,3 +99,55 @@ test('missing income account section gives a clear error', () => {
 test('missing Airbnb columns give a clear error', () => {
   assert.throws(() => C.parseAirbnb('a,b\n1,2', cfg), /missing column/);
 });
+
+// ---- SOP alignment tests ----
+const run3 = () => C.analyze({ airbnb: C.parseAirbnb(csv, cfg), qbo: qbo(), stripe: null }, cfg, ['2030-03']);
+
+test('only the three SOP escalation categories block posting', () => {
+  const r = run3();
+  const byCode = Object.fromEntries(r.exceptions.map((e) => [e.code, e]));
+  assert.ok(C.BLOCKING.includes('new-listing') && C.BLOCKING.includes('empire-property'));
+  assert.equal(byCode['duplicate'].sev, 'fix');
+  assert.ok(!C.BLOCKING.includes('duplicate') && !C.BLOCKING.includes('no-payout'));
+});
+
+test('escalation email lists SOP items with date, listing, guest, amount; leaves out duplicates', () => {
+  const mail = C.escalationEmail(run3());
+  assert.match(mail, /New listing not in the class table/);
+  assert.match(mail, /03\/12\/2030 \| Brand New Listing \| Sleeps 2 \| D \| 100\.00/);
+  assert.match(mail, /Property booking paid to Empire/);
+  assert.doesNotMatch(mail, /Duplicate deposits/);
+});
+
+test('step 5 summary: destination by class, excluded accounts shown but not booked', () => {
+  const r = run3();
+  const paypal = r.destSummary.find((d) => d.dest === 'PayPal' && d.cls === 'NOLA');
+  assert.equal(paypal.status, 'Excluded'); assert.equal(paypal.amt, 40);
+  const cpc = r.destSummary.filter((d) => d.dest === '1393');
+  assert.deepEqual(cpc.map((d) => [d.cls, d.amt]).sort(), [['Cassville WI', 1000], ['NOLA', 450]]);
+  assert.ok(r.destSummary.find((d) => d.dest === '6673' && d.cls === '(not a property booking)'));
+});
+
+test('deposit check fails when a payout is posted twice in QuickBooks', () => {
+  const r = run3();
+  assert.equal(r.checks.find((c) => c.label.startsWith('Total deposited')).ok, false);
+});
+
+test('period parser', () => {
+  assert.equal(C.parsePeriod('January, 2025-August, 2026').length, 20);
+  assert.deepEqual(C.parsePeriod('March 2030'), ['2030-03']);
+  assert.equal(C.parsePeriod('January 1-September 25, 2026').length, 9);
+  assert.equal(C.parsePeriod('nothing'), null);
+});
+
+test('step 10: P&L by class after posting is compared with the correct totals', () => {
+  const r = run3();
+  const mk = (c, n, o) => [['Test Co'], ['Profit and Loss'], ['March 2030'], [], ['', 'Cassville WI', 'NOLA', 'Ohio Homesteading', 'Total'], ['Income'], ['Rental Income', c, n, o, c + n + o]];
+  const t = r.truth['2030-03'];
+  const good = C.comparePnl(r, C.parsePnl(mk(t['Cassville WI'], t['NOLA'], t['Ohio Homesteading']), cfg));
+  assert.ok(good.comparable && good.ok);
+  const bad = C.comparePnl(r, C.parsePnl(mk(t['Cassville WI'] + 5, t['NOLA'], t['Ohio Homesteading']), cfg));
+  assert.equal(bad.ok, false);
+  const wrongPeriod = C.comparePnl(r, C.parsePnl([['x'], ['Profit and Loss'], ['January, 2025-August, 2026'], [], ['', 'A', 'B'], ['Rental Income', 1, 2]], cfg));
+  assert.equal(wrongPeriod.comparable, false);
+});

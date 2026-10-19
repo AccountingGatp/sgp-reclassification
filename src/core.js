@@ -231,7 +231,10 @@ export function parseStripe(sheets, cfg) {
   const rules = cfg.stripeRules.map((x) => ({ contains: normListing(x.contains), cls: x.cls }));
   for (const l of lines) {
     const n = normListing(l.desc);
-    l.cls = classify(l.listing) ?? rules.find((r) => n.includes(r.contains))?.cls ?? null;
+    const exact = classify(l.listing);
+    const rule = exact ? null : rules.find((r) => n.includes(r.contains));
+    l.cls = exact ?? rule?.cls ?? null;
+    l.viaRule = !exact && !!rule;
   }
   // Disputes / chargebacks carry no listing: inherit the class of the charge they reverse.
   for (const l of lines) {
@@ -274,6 +277,9 @@ export function monthInfo({ airbnb, qbo }) {
   }
   return out;
 }
+
+// SOP "Escalate to Jonathan and Jennifer": only these stop posting.
+export const BLOCKING = ['new-listing', 'empire-property', 'unknown-destination', 'no-tie', 'foreign'];
 
 // ---------------------------------------------------------------- the SOP run
 export function analyze({ airbnb, qbo, stripe }, cfg, months) {
@@ -435,6 +441,12 @@ export function analyze({ airbnb, qbo, stripe }, cfg, months) {
     if (!unmappedListings.has(key)) unmappedListings.set(key, { listing: l.listing || l.desc, source: 'Stripe', items: [] });
     unmappedListings.get(key).items.push({ date: sdate(l.dates), listing: l.listing || l.desc, guest: l.guest, amount: l.net, ref: l.payoutId });
   }
+  if (stripe) {
+    const via = new Map();
+    for (const l of stripe.lines) if (l.viaRule) via.set(normListing(l.listing), { date: undefined, listing: l.listing, amount: undefined, note: `classed ${l.cls} by keyword rule` });
+    if (via.size) addEx({ sev: 'open', code: 'stripe-keyword', title: 'Stripe listings classed by keyword, not by the class table',
+      detail: 'The SOP matches the listing name exactly. Confirm these classes and add the names to the class table.', items: [...via.values()] });
+  }
   for (const u of unmappedListings.values()) {
     addEx({ sev: 'escalate', code: 'new-listing', title: `New listing not in the class table (${u.source})`, listing: u.listing,
       detail: `"${u.listing}". Held in its booked class until Jonathan confirms the class. Add it in Settings once known.`, items: u.items });
@@ -476,16 +488,16 @@ export function analyze({ airbnb, qbo, stripe }, cfg, months) {
   if (dups.length) addEx({ sev: 'fix', code: 'duplicate', title: 'Duplicate deposits in QuickBooks',
     detail: 'The same Airbnb payout reference is posted more than once. Not reclassed. Check the bank statement, then delete the duplicate in QuickBooks.',
     items: dups.map((r) => ({ date: r.date.mdy, listing: r.split, amount: r.amount, ref: (r.desc.match(/[GM]-[A-Z0-9]{8,}/i) ?? [''])[0] })) });
-  if (noPayout.length) addEx({ sev: 'escalate', code: 'no-payout', title: 'QuickBooks deposit with no matching payout in the files',
+  if (noPayout.length) addEx({ sev: 'open', code: 'no-payout', title: 'QuickBooks deposit with no matching payout in the files',
     detail: 'Could be a prior-month payout, a payout outside the export range, or a missing report. Left in its booked class.',
     items: noPayout.map((r) => ({ date: r.date.mdy, listing: r.split, amount: r.amount, note: r.name })) });
   for (const [k, rs] of others) addEx({ sev: 'info', code: 'other-income', title: `Other income left as booked: ${k} (${rs.length})`,
     detail: 'No listing data supplied, so it is not reclassed.', items: rs.map((r) => ({ date: r.date.mdy, listing: r.split, amount: r.amount, note: r.cls })) });
   const unmatchedP = bookedPayouts.filter((p) => !p.qbo && inSel(p.date));
-  if (unmatchedP.length) addEx({ sev: 'escalate', code: 'not-in-qbo', title: 'Airbnb payout not found in QuickBooks',
+  if (unmatchedP.length) addEx({ sev: 'open', code: 'not-in-qbo', title: 'Airbnb payout not found in QuickBooks',
     detail: 'Check the bank statement; deposits near month-end may land in the next month. Not included in the reclass.',
     items: unmatchedP.map((p) => ({ date: p.date.mdy, listing: p.destLabel, amount: p.paid, ref: p.ref })) });
-  if (stripeUnmatched.length) addEx({ sev: 'escalate', code: 'stripe-not-in-qbo', title: 'Stripe payout not found in QuickBooks',
+  if (stripeUnmatched.length) addEx({ sev: 'open', code: 'stripe-not-in-qbo', title: 'Stripe payout not found in QuickBooks',
     detail: 'No QuickBooks deposit with that amount near the payout date.',
     items: stripeUnmatched.flatMap((m) => (m.missing ?? m.p.lines).map((l) => ({ date: sdate(m.p.dates), listing: l.listing || l.desc, guest: l.guest, amount: l.net, ref: m.p.id }))) });
   const open = [];
@@ -495,15 +507,31 @@ export function analyze({ airbnb, qbo, stripe }, cfg, months) {
   for (const w of airbnb.warnings) open.push(w);
   if (open.length) addEx({ sev: 'open', code: 'coverage', title: 'Coverage warnings', detail: open.join(' '), items: [] });
 
+  // ---- Step 5: one summary of destination by class (excluded destinations shown but not booked)
+  const ds = new Map();
+  for (const p of airbnb.payouts) {
+    if (!p.date || !sel.has(p.date.month)) continue;
+    for (const l of p.lines) {
+      if (l.currency !== 'USD') continue;
+      const c = l.cls ?? (p.booked ? '(unmapped listing)' : '(not a property booking)');
+      const k = [p.date.month, p.destKey, p.destLabel, p.booked ? 'Booked' : 'Excluded', c].join('\u0001');
+      ds.set(k, round2((ds.get(k) ?? 0) + l.amount));
+    }
+  }
+  const destSummary = [...ds.entries()].map(([k, amt]) => { const [month, dest, label, status, cls] = k.split('\u0001'); return { month, dest, label, status, cls, amt }; })
+    .sort((a, b) => a.month.localeCompare(b.month) || a.dest.localeCompare(b.dest) || a.cls.localeCompare(b.cls));
+
   // ---- Tie-out checks (SOP "Tie-out checks before you post")
   const checks = [];
   const bookedTie = bookedPayouts.filter((p) => p.ties).length;
   checks.push({ ok: bookedTie === bookedPayouts.length, label: 'Every booked Airbnb payout ties to its lines (±$' + tol.toFixed(2) + ')', detail: `${bookedTie} of ${bookedPayouts.length}` });
-  const inScopePayouts = bookedPayouts.filter((p) => p.qbo && sel.has(p.qbo.month));
-  const classified = round2(items.filter((i) => i.src !== 'as booked' && sel.has(rowById.get(i.rowId).month)).reduce((a, i) => a + i.amt, 0));
-  const matchedRows = new Set(items.filter((i) => i.src !== 'as booked').map((i) => i.rowId));
-  const deposited = round2([...matchedRows].map((id) => rowById.get(id)).filter((r) => sel.has(r.month)).reduce((a, r) => a + r.amount, 0));
-  checks.push({ ok: Math.abs(classified - deposited) < 0.01, label: 'Total classified by class equals total deposited to the booked accounts', detail: `${classified.toFixed(2)} vs ${deposited.toFixed(2)}` });
+  const payoutsNoDeposit = bookedPayouts.filter((p) => !p.qbo && inSel(p.date));
+  const depositsNoPayout = [...dups, ...noPayout].filter((r) => /airbnb/i.test(r.name + ' ' + r.desc));
+  checks.push({ ok: !payoutsNoDeposit.length && !depositsNoPayout.length,
+    label: 'Total deposited to 2665 and 1393 equals the Airbnb payouts: every payout has a deposit and every Airbnb deposit has a payout',
+    detail: `${payoutsNoDeposit.length} payout(s) without a deposit, ${depositsNoPayout.length} deposit(s) without a payout` });
+  const coHost = bookedPayouts.filter((p) => p.lines.some((l) => /co-?host/i.test(l.type)));
+  checks.push({ ok: coHost.every((p) => p.ties), label: 'Payouts with a co-host cut are counted net of the cut (negative lines included, total ties to the deposit)', detail: `${coHost.length} payout(s) with a co-host cut` });
   const unbal = journal.filter((j) => Math.abs(j.lines.reduce((a, l) => a + (l.debit ?? 0) - (l.credit ?? 0), 0)) > 0.004);
   checks.push({ ok: unbal.length === 0, label: 'Debits equal credits in every journal entry', detail: `${journal.length} entries` });
   const bad = journal.filter((j) => new Set(j.lines.map((l) => l.no)).size !== 1);
@@ -515,11 +543,11 @@ export function analyze({ airbnb, qbo, stripe }, cfg, months) {
   let maxDiff = 0;
   for (const m of sortedMonths) for (const c of classes) maxDiff = Math.max(maxDiff, Math.abs((post[m][c] ?? 0) - (truth[m]?.[c] ?? 0)));
   checks.push({ ok: maxDiff < 0.01, label: 'After the entries, each class equals the Airbnb/Stripe total for that class', detail: `max difference ${maxDiff.toFixed(2)}` });
-  const blocking = exceptions.filter((e) => e.sev === 'escalate' && e.code !== 'foreign-excluded');
+  const blocking = exceptions.filter((e) => BLOCKING.includes(e.code));
   checks.push({ ok: blocking.length === 0, label: 'No open escalation items', detail: blocking.length ? `${blocking.length} to resolve before posting` : '' });
 
   return {
-    months: sortedMonths, classes, cur, truth, adj, post, journal, exceptions, checks,
+    months: sortedMonths, classes, cur, truth, adj, post, journal, exceptions, checks, destSummary,
     payouts: airbnb.payouts, bookedPayouts, items, rows, stripe: stripeResult, stripeData: stripe,
     journalStart: num, summary: {
       payoutsBooked: bookedPayouts.length, matched: bookedPayouts.filter((p) => p.qbo).length,
@@ -540,13 +568,13 @@ export function journalCsv(result) {
 }
 
 export function escalationEmail(result) {
-  const ex = result.exceptions.filter((e) => e.sev === 'escalate' || e.sev === 'fix');
+  const ex = result.exceptions.filter((e) => BLOCKING.includes(e.code) || e.code === 'foreign-excluded');
   if (!ex.length) return 'Nothing to escalate for this run.';
   const mo = result.months.join(', ');
   const out = [`Subject: Airbnb reclass queries for ${mo}`, '', 'Hi Jonathan and Jennifer,', '',
     'While reclassifying Steven\'s Airbnb payouts we need your input on the items below before we post.', ''];
   ex.forEach((e, i) => {
-    out.push(`${i + 1}. ${e.title}`);
+    out.push(`${i + 1}. ${e.title}${e.code === 'foreign-excluded' ? ' (for your information)' : ''}`);
     out.push(`   ${e.detail}`);
     for (const it of e.items.slice(0, 60)) {
       out.push(`   - ${[it.date, it.listing, it.guest, it.amount !== undefined ? (+it.amount).toFixed(2) : '', it.note].filter((x) => x !== undefined && x !== '').join(' | ')}`);
@@ -558,6 +586,55 @@ export function escalationEmail(result) {
   return out.join('\n');
 }
 
+// ---------------------------------------------------------------- SOP step 10: P&L by Class after posting
+export function isPnlRows(rows) {
+  return rows.slice(0, 5).some((r) => /^profit and loss/i.test(clean(r[0])));
+}
+const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
+export function parsePeriod(text) {
+  const re = new RegExp(`(${MONTHS.join('|')})(?:\\s+\\d{1,2}(?!\\d))?(?:\\s*,?\\s*(\\d{4}))?`, 'gi');
+  const hits = []; let m;
+  while ((m = re.exec(text))) hits.push({ mo: MONTHS.indexOf(m[1].toLowerCase()) + 1, y: m[2] ? +m[2] : null });
+  if (!hits.length) return null;
+  const lastY = [...hits].reverse().find((h) => h.y)?.y;
+  if (!lastY) return null;
+  for (let i = hits.length - 1; i >= 0; i--) if (!hits[i].y) hits[i].y = i + 1 < hits.length && hits[i + 1].y ? hits[i + 1].y : lastY;
+  const a = hits[0], z = hits[hits.length - 1];
+  const out = []; let y = a.y, mo = a.mo;
+  for (let guard = 0; guard < 120; guard++) {
+    out.push(`${y}-${String(mo).padStart(2, '0')}`);
+    if (y === z.y && mo === z.mo) break;
+    mo++; if (mo > 12) { mo = 1; y++; }
+  }
+  return out;
+}
+export function parsePnl(rows, cfg) {
+  const period = rows.slice(0, 6).map((r) => clean(r[0])).find((t) => /\d{4}/.test(t) && !/^profit/i.test(t)) ?? '';
+  const hi = rows.findIndex((r, i) => i >= 2 && !clean(r[0]) && r.slice(1).filter((c) => clean(c)).length >= 2);
+  if (hi < 0) throw new Error('Could not find the class columns. Run Profit and Loss with Class as the column.');
+  const head = rows[hi].map(clean);
+  const line = rows.find((r, i) => i > hi && clean(r[0]) === cfg.incomeAccount);
+  if (!line) throw new Error(`No "${cfg.incomeAccount}" row in the Profit and Loss.`);
+  const byClass = {};
+  head.forEach((h, i) => { if (i > 0 && h && !/^total$/i.test(h)) byClass[h] = toNumber(line[i]) ?? 0; });
+  return { period, months: parsePeriod(period), byClass };
+}
+// Compare a P&L run after posting with the correct totals from this run.
+export function comparePnl(result, pnl) {
+  const want = [...result.months].sort();
+  if (!pnl.months || pnl.months.join() !== want.join()) {
+    return { comparable: false, message: `The P&L covers "${pnl.period || 'an unknown period'}", but the selected months are ${want.join(', ')}. Run the P&L for exactly the selected months, after posting.` };
+  }
+  const rows = [];
+  const classes = new Set([...result.classes, ...Object.keys(pnl.byClass)]);
+  for (const c of classes) {
+    const expected = round2(want.reduce((a, m) => a + (result.truth[m]?.[c] ?? 0), 0));
+    const actual = round2(pnl.byClass[c] ?? 0);
+    rows.push({ cls: c, expected, actual, diff: round2(actual - expected), ok: Math.abs(actual - expected) < 0.01 });
+  }
+  return { comparable: true, rows, ok: rows.every((r) => r.ok) };
+}
+
 export function workpaperSheets(result) {
   const sheets = {};
   const sum = [];
@@ -566,6 +643,7 @@ export function workpaperSheets(result) {
     if (a || b || d) sum.push({ Month: m, Class: c, 'Booked in QBO today (incl. earlier reclass entries)': a, 'Correct per Airbnb/Stripe': b, 'Reclass needed (+credit / -debit)': d });
   }
   sheets['Summary by month'] = sum;
+  sheets['Destination x class'] = result.destSummary.map((d) => ({ Month: d.month, Destination: d.label, Status: d.status, Class: d.cls, Amount: d.amt }));
   sheets['Journal entries'] = result.journal.flatMap((j) => j.lines.map((l) => ({
     '*JournalNo': l.no, '*JournalDate': l.date, '*AccountName': l.account, Debits: l.debit ?? '', Credits: l.credit ?? '', Description: l.desc, Name: l.name, Class: l.cls })));
   sheets['Exceptions'] = result.exceptions.flatMap((e) => (e.items.length ? e.items : [{}]).map((it) => ({

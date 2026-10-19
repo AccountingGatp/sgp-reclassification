@@ -80,3 +80,4 @@ select,input[type=text],input[type=number]{font:inherit;padding:6px 8px;border:1
 @media (max-width:640px){ .card{padding:14px} h1{font-size:19px} .row input[type=text]{min-width:0} }
 .files li>span{min-width:0;overflow-wrap:anywhere}
 .files li .btn{flex:none}
+.ack{display:flex;gap:8px;align-items:center;margin:0 0 10px;font-size:14px}.btn:disabled{opacity:.5;cursor:not-allowed}

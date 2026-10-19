@@ -10,7 +10,8 @@ const cls$ = (n) => (Math.abs(n) < 0.005 ? 'zero' : n > 0 ? 'pos' : 'neg');
 const LS_KEY = 'property-reclass-config-v1';
 const state = {
   cfg: loadConfig(),
-  inputs: { airbnb: null, qbo: null, stripe: [] },
+  inputs: { airbnb: null, qbo: null, stripe: [], pnl: null },
+  ack: false, ackKey: '',
   parsed: null, months: new Set(), monthList: [], result: null, tab: 'summary', picked: false,
 };
 
@@ -55,6 +56,10 @@ async function ingestAll(files) {
           const cur = state.inputs.qbo;
           if (!cur || mine.max > cur.max || (mine.max === cur.max && mine.n >= cur.n)) state.inputs.qbo = mine;
           else addSkipped(f.name, 'Older QuickBooks export; the one with later dates is used');
+        } else if (core.isPnlRows(sheets[0]?.rows ?? [])) {
+          const p = core.parsePnl(sheets[0].rows, state.cfg);
+          state.inputs.pnl = { name: f.name, rows: sheets[0].rows, info: `period: ${p.period || 'unknown'}` };
+          state.tab = 'after';
         } else if (sheets.some((s) => core.isStripeRows(s.rows))) {
           state.inputs.stripe = state.inputs.stripe.filter((x) => x.name !== f.name);
           const p = core.parseStripe(sheets, state.cfg);
@@ -79,6 +84,7 @@ function renderFiles() {
   const { airbnb, qbo, stripe } = state.inputs;
   if (airbnb) li.push(fileRow('airbnb', 'Airbnb', airbnb.name, airbnb.info, () => { state.inputs.airbnb = null; }));
   if (qbo) li.push(fileRow('qbo', 'QuickBooks', qbo.name, qbo.info, () => { state.inputs.qbo = null; }));
+  if (state.inputs.pnl) li.push(fileRow('airbnb', 'P&L (after)', state.inputs.pnl.name, state.inputs.pnl.info, () => { state.inputs.pnl = null; }));
   for (const s of stripe) li.push(fileRow('stripe', 'Stripe', s.name, s.info, () => { state.inputs.stripe = state.inputs.stripe.filter((x) => x !== s); }));
   for (const s of skipped.splice(0)) li.push(fileRow('skip', 'Skipped', s.name, s.note));
   const ul = $('#files'); ul.innerHTML = '';
@@ -134,18 +140,23 @@ function renderMonths() {
 }
 
 // ------------------------------------------------------------ results
-const TABS = [['summary', 'Summary'], ['entries', 'Journal entries'], ['exceptions', 'Exceptions'], ['checks', 'Checks'], ['payouts', 'Payouts'], ['email', 'Email draft']];
+const TABS = [['summary', 'Summary'], ['entries', 'Journal entries'], ['exceptions', 'Exceptions'], ['checks', 'Checks'], ['payouts', 'Payouts'], ['email', 'Email draft'], ['after', 'After posting']];
 
 function renderResults() {
   const r = state.result;
   $('#results').hidden = false;
-  const esc2 = r.exceptions.filter((e) => e.sev === 'escalate' && e.code !== 'foreign-excluded').length;
+  const blocking = r.exceptions.filter((e) => core.BLOCKING.includes(e.code));
+  const esc2 = blocking.length;
+  const key = blocking.map((e) => e.code + e.title).join('|');
+  if (key !== state.ackKey) { state.ackKey = key; state.ack = false; }
   const failed = r.checks.filter((c) => !c.ok && c.label !== 'No open escalation items').length;
   const b = $('#banner');
-  if (failed) { b.className = 'banner warn'; b.innerHTML = `<div>A tie-out check failed<small>Review the Checks tab before using the import file.</small></div>`; }
-  else if (esc2) { b.className = 'banner warn'; b.innerHTML = `<div>${r.journal.length} journal ${r.journal.length === 1 ? 'entry' : 'entries'} ready, ${esc2} item${esc2 === 1 ? '' : 's'} to escalate first<small>Per the SOP, ask Jonathan and Jennifer about the escalation items before posting.</small></div>`; }
+  if (esc2) { b.className = 'banner warn'; b.innerHTML = `<div>Stop: ${esc2} item${esc2 === 1 ? '' : 's'} to escalate before posting<small>The SOP says to ask Jonathan and Jennifer first. The import file stays locked until you confirm they have answered. ${failed ? 'A tie-out check also needs review (Checks tab).' : ''}</small></div>`; }
+  else if (failed) { b.className = 'banner warn'; b.innerHTML = `<div>${r.journal.length} journal ${r.journal.length === 1 ? 'entry' : 'entries'} built, a tie-out check needs review<small>See the Checks and Exceptions tabs (for example duplicate deposits) before posting.</small></div>`; }
   else { b.className = 'banner ok'; b.innerHTML = `<div>${r.journal.length} journal ${r.journal.length === 1 ? 'entry' : 'entries'} ready to post<small>All tie-out checks pass. Have a second person review before posting.</small></div>`; }
-  $('#dlCsv').disabled = !r.journal.length;
+  const ack = $('#ack'); ack.checked = state.ack; $('#ackWrap').hidden = !esc2;
+  $('#dlCsv').disabled = !r.journal.length || (esc2 > 0 && !state.ack);
+  $('#dlCsv').title = $('#dlCsv').disabled && esc2 ? 'Locked until the escalation items are answered' : '';
 
   const tabs = $('#tabs'); tabs.innerHTML = '';
   for (const [id, label] of TABS) {
@@ -156,8 +167,9 @@ function renderResults() {
     tabs.append(t);
   }
   const p = $('#panel');
-  p.innerHTML = { summary, entries, exceptions, checks, payouts, email }[state.tab](r);
+  p.innerHTML = { summary, entries, exceptions, checks, payouts, email, after }[state.tab](r);
   if (state.tab === 'exceptions') bindAssign();
+  if (state.tab === 'after') bindAfter();
 }
 
 function summary(r) {
@@ -171,7 +183,10 @@ function summary(r) {
     }
     if (!any) h += `<tr><td>${esc(m)}</td><td colspan="4" class="zero">No rental income lines</td></tr>`;
   }
-  h += '</tbody></table><p class="hint" style="margin-top:12px">"Booked today" includes reclass entries already posted (earlier journal numbers are never edited). "Correct" is the Airbnb and Stripe total by listing class.</p>';
+  h += '</tbody></table>';
+  h += '<h3 style="margin:20px 0 6px;font-size:15px">Airbnb payouts by destination and class (SOP step 5)</h3><table><thead><tr><th>Payout month</th><th>Destination</th><th>Status</th><th>Class</th><th class="num">Amount</th></tr></thead><tbody>';
+  for (const d of r.destSummary) h += `<tr><td>${esc(d.month)}</td><td>${esc(d.label)}</td><td>${d.status === 'Booked' ? 'Booked' : '<span class="zero">Excluded, not booked</span>'}</td><td>${esc(d.cls)}</td><td class="num">${money(d.amt)}</td></tr>`;
+  h += '</tbody></table><p class="hint" style="margin-top:12px">Payout month here is the Airbnb payout date; the table above uses the QuickBooks deposit date. "Booked today" includes reclass entries already posted (earlier journal numbers are never edited). "Correct" is the Airbnb and Stripe total by listing class.</p>';
   return h;
 }
 
@@ -222,6 +237,20 @@ function email(r) {
   return `<textarea readonly style="width:100%;min-height:340px;font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink)">${esc(core.escalationEmail(r))}</textarea>`;
 }
 
+function after(r) {
+  const pnl = state.inputs.pnl;
+  let h = `<p class="hint">SOP step 10. After you post the entries, run <strong>Profit and Loss by Class</strong> in QuickBooks for exactly the selected months (${esc(r.months.join(', '))}), with classes as columns, and drop the file anywhere on this page. Rental Income for each class must equal the correct total.</p>`;
+  if (!pnl) return h + '<p class="empty">No Profit and Loss added yet.</p>';
+  try {
+    const cmp = core.comparePnl(r, core.parsePnl(pnl.rows, state.cfg));
+    if (!cmp.comparable) return h + `<div class="err">${esc(cmp.message)}</div>`;
+    h += `<div class="banner ${cmp.ok ? 'ok' : 'warn'}">${cmp.ok ? 'Every class matches the Airbnb and Stripe totals' : 'Some classes do not match'}</div>`;
+    h += '<table><thead><tr><th>Class</th><th class="num">Expected (correct)</th><th class="num">P&amp;L Rental Income</th><th class="num">Difference</th><th></th></tr></thead><tbody>' + cmp.rows.map((x) => `<tr><td>${esc(x.cls)}</td><td class="num">${money(x.expected)}</td><td class="num">${money(x.actual)}</td><td class="num ${cls$(x.diff)}">${money(x.diff)}</td><td><span class="pill ${x.ok ? 'pass' : 'fail'}">${x.ok ? 'Match' : 'Review'}</span></td></tr>`).join('') + '</tbody></table>';
+  } catch (e) { h += `<div class="err">${esc(e.message)}</div>`; }
+  return h + `<p><button class="btn sm" id="rmPnl">Remove P&amp;L</button></p>`;
+}
+function bindAfter() { const b = $('#rmPnl'); if (b) b.addEventListener('click', () => { state.inputs.pnl = null; renderFiles(); renderResults(); }); }
+
 // ------------------------------------------------------------ downloads
 function download(name, blob) {
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.append(a); a.click();
@@ -241,6 +270,7 @@ $('#dlXlsx').addEventListener('click', () => {
   const out = X.write(wb, { bookType: 'xlsx', type: 'array' });
   download(`reclass-workpaper_${span()}.xlsx`, new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
 });
+$('#ack').addEventListener('change', (e) => { state.ack = e.target.checked; renderResults(); });
 $('#copyMail').addEventListener('click', async (e) => {
   const text = core.escalationEmail(state.result); const b = e.currentTarget;
   try { await navigator.clipboard.writeText(text); } catch {

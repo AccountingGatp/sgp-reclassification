@@ -24,6 +24,8 @@ Nothing is month-specific: months, payouts, deposits and the next journal number
 - Compares the correct class totals to what QuickBooks holds now, including reclass entries already posted, and builds one entry per month and per source class. Debit lowers a class, credit raises it. Old entries are never edited.
 - Runs the SOP tie-out checks and lists duplicates, new listings, unmatched deposits and coverage problems.
 
+See [docs/SOP_COVERAGE.md](docs/SOP_COVERAGE.md) for a line-by-line map of the SOP to the tool, what was adapted, and what is deliberately left manual.
+
 ## Settings
 
 The class table, payout destinations, Stripe keyword rules, journal prefix, tolerance and deposit window are editable under *Rules and settings*. They are saved in your browser and can be exported/imported as JSON. A new listing found in a run can be assigned to a class straight from the Exceptions tab.
