@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Property Reclass Tool</title>
+  <meta name="description" content="Upload the monthly Airbnb, QuickBooks and Stripe exports and get the property reclass journal import and workpaper. Runs entirely in your browser.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f5d50'/%3E%3Cpath d='M7 17l9-8 9 8v8H7z' fill='none' stroke='%23fff' stroke-width='2.2' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="wrap">
+      <div>
+        <h1>Property reclass</h1>
+        <p class="sub">Airbnb payouts to QuickBooks classes, per the monthly SOP.</p>
+      </div>
+      <p class="privacy" title="Nothing is sent to a server. Files are read and processed locally in this tab.">Runs in your browser. Files are never uploaded.</p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="card" aria-labelledby="s1">
+      <h2 id="s1"><span class="step">1</span> Add this month's exports</h2>
+      <div id="drop" class="drop" tabindex="0" role="button" aria-label="Choose files or drop them here">
+        <span><strong>Drop all the files here</strong> or <u>choose files</u></span>
+        <small>Airbnb transaction CSV, QuickBooks Transaction Detail by Account (.xlsx), Stripe report (.xlsx, optional). Other QuickBooks reports are ignored.</small>
+        <input id="file" type="file" multiple accept=".csv,.xlsx,.xls" hidden>
+      </div>
+      <ul id="files" class="files" aria-live="polite"></ul>
+      <p id="loaderr" class="err" role="alert" hidden></p>
+    </section>
+
+    <section id="monthsCard" class="card" hidden aria-labelledby="s2">
+      <h2 id="s2"><span class="step">2</span> Months to reclass</h2>
+      <p class="hint">Months follow the QuickBooks deposit date. A month is marked incomplete when the Airbnb or QuickBooks export stops before month-end.</p>
+      <div id="months" class="months"></div>
+    </section>
+
+    <section id="results" hidden aria-live="polite">
+      <div id="banner" class="banner"></div>
+      <div class="actions">
+        <button id="dlCsv" class="btn primary">Download QBO import (.csv)</button>
+        <button id="dlXlsx" class="btn">Download workpaper (.xlsx)</button>
+        <button id="copyMail" class="btn">Copy escalation email</button>
+      </div>
+      <nav class="tabs" role="tablist" id="tabs"></nav>
+      <div id="panel" class="card panel"></div>
+    </section>
+
+    <section class="card" id="settingsCard" hidden>
+      <h2>Settings</h2>
+      <div id="settings"></div>
+    </section>
+  </main>
+
+  <footer class="wrap foot">
+    <button id="openSettings" class="link">Rules and settings</button>
+    <span>Rules come from the SOP and can be edited. Changes are saved in this browser only.</span>
+  </footer>
+
+  <script src="vendor/xlsx.full.min.js"></script>
+  <script type="module" src="src/app.js"></script>
+</body>
+</html>

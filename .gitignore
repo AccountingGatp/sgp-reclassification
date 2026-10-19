@@ -1,0 +1,8 @@
+node_modules/
+.vercel/
+.DS_Store
+# Never commit real financial exports
+*.csv
+*.xlsx
+*.xls
+!tests/fixtures/**
