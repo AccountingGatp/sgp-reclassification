@@ -10,7 +10,7 @@ const cls$ = (n) => (Math.abs(n) < 0.005 ? 'zero' : n > 0 ? 'pos' : 'neg');
 const LS_KEY = 'property-reclass-config-v1';
 const state = {
   cfg: loadConfig(),
-  inputs: { airbnb: null, qbo: null, stripe: [], pnl: null },
+  inputs: { airbnb: [], qbo: null, stripe: [], pnl: null },
   ack: false, ackKey: '',
   parsed: null, months: new Set(), monthList: [], result: null, tab: 'summary', picked: false,
 };
@@ -46,7 +46,9 @@ async function ingestAll(files) {
         const head = text.slice(0, 3000);
         if (/Paid out/.test(head) && /Reference code/.test(head)) {
           const p = core.parseAirbnb(text, state.cfg);
-          state.inputs.airbnb = { name: f.name, text, info: `${p.payouts.length} payouts, ${p.minDate?.mdy ?? '?'} to ${p.maxDate?.mdy ?? '?'}` };
+          state.inputs.airbnb = state.inputs.airbnb.filter((x) => x.name !== f.name);
+          state.inputs.airbnb.push({ name: f.name, text, max: p.maxDate?.t ?? 0, info: `${p.payouts.length} payouts, ${p.minDate?.mdy ?? '?'} to ${p.maxDate?.mdy ?? '?'}` });
+          state.inputs.airbnb.sort((a, b) => b.max - a.max);
         } else addSkipped(f.name, 'CSV is not an Airbnb transaction export');
       } else if (ext === 'xlsx' || ext === 'xls') {
         const sheets = await readSheets(f);
@@ -82,14 +84,14 @@ function setErr(m) { const el = $('#loaderr'); el.textContent = m; el.hidden = !
 function renderFiles() {
   const li = [];
   const { airbnb, qbo, stripe } = state.inputs;
-  if (airbnb) li.push(fileRow('airbnb', 'Airbnb', airbnb.name, airbnb.info, () => { state.inputs.airbnb = null; }));
+  airbnb.forEach((a, i) => li.push(fileRow('airbnb', i === 0 ? 'Airbnb' : 'Airbnb (prior month)', a.name, a.info, () => { state.inputs.airbnb = state.inputs.airbnb.filter((x) => x !== a); })));
   if (qbo) li.push(fileRow('qbo', 'QuickBooks', qbo.name, qbo.info, () => { state.inputs.qbo = null; }));
   if (state.inputs.pnl) li.push(fileRow('airbnb', 'P&L (after)', state.inputs.pnl.name, state.inputs.pnl.info, () => { state.inputs.pnl = null; }));
   for (const s of stripe) li.push(fileRow('stripe', 'Stripe', s.name, s.info, () => { state.inputs.stripe = state.inputs.stripe.filter((x) => x !== s); }));
   for (const s of skipped.splice(0)) li.push(fileRow('skip', 'Skipped', s.name, s.note));
   const ul = $('#files'); ul.innerHTML = '';
   const missing = [];
-  if (!airbnb) missing.push('Airbnb CSV'); if (!qbo) missing.push('QuickBooks Transaction Detail by Account');
+  if (!airbnb.length) missing.push('Airbnb CSV'); if (!qbo) missing.push('QuickBooks Transaction Detail by Account');
   for (const l of li) ul.append(l);
   if (missing.length && li.length) { const m = document.createElement('li'); m.innerHTML = `<span class="meta">Still needed: ${esc(missing.join(', '))}</span>`; ul.append(m); }
 }
@@ -106,9 +108,9 @@ function compute() {
   renderFiles();
   state.result = null;
   const { airbnb, qbo, stripe } = state.inputs;
-  if (!airbnb || !qbo) { $('#monthsCard').hidden = true; $('#results').hidden = true; return; }
+  if (!airbnb.length || !qbo) { $('#monthsCard').hidden = true; $('#results').hidden = true; return; }
   try {
-    const a = core.parseAirbnb(airbnb.text, state.cfg);
+    const a = core.mergeAirbnb(airbnb.map((x) => core.parseAirbnb(x.text, state.cfg)));
     const q = core.parseQbo(qbo.rows, state.cfg);
     const s = stripe.length ? core.parseStripe(stripe.flatMap((x) => x.sheets), state.cfg) : null;
     state.parsed = { airbnb: a, qbo: q, stripe: s };
@@ -190,9 +192,17 @@ function summary(r) {
   return h;
 }
 
+function timingBlock(r) {
+  if (!r.timing?.length) return '';
+  return `<h3 style="margin:14px 0 6px;font-size:15px">Timing adjustments <span class="meta" style="color:var(--muted);font-weight:400">· already netted into the entries below</span></h3>
+    <table><thead><tr><th>Month</th><th>Deposit date</th><th>Payout</th><th class="num">Amount</th><th>Debit (reverses earlier move)</th><th>Credit</th><th>Earlier entry</th></tr></thead><tbody>
+    ${r.timing.map((t) => `<tr><td>${esc(t.month)}</td><td>${esc(t.depositDate)}</td><td>${esc(t.ref)} · ${esc(t.payoutDate)}</td><td class="num">${money(t.amount)}</td><td>${esc(t.fromClass)}</td><td>${esc(t.toClass)}</td><td>${esc(t.priorNo)}</td></tr>`).join('')}
+    </tbody></table>`;
+}
+
 function entries(r) {
-  if (!r.journal.length) return '<p class="empty">Nothing to reclass for the selected months. Booked classes already match.</p>';
-  return r.journal.map((j) => `
+  if (!r.journal.length) return timingBlock(r) + '<p class="empty">Nothing to reclass for the selected months. Booked classes already match.</p>';
+  return timingBlock(r) + r.journal.map((j) => `
     <h3 style="margin:14px 0 6px;font-size:15px">${esc(j.no)} <span class="meta" style="color:var(--muted);font-weight:400">· ${esc(j.month)} · out of ${esc(j.source)} · ${money(j.total)}</span></h3>
     <table><thead><tr><th>Journal no</th><th>Date</th><th>Account</th><th class="num">Debit</th><th class="num">Credit</th><th>Class</th><th>Description</th></tr></thead><tbody>
     ${j.lines.map((l) => `<tr><td>${esc(l.no)}</td><td>${esc(l.date)}</td><td>${esc(l.account)}</td><td class="num">${money(l.debit)}</td><td class="num">${money(l.credit)}</td><td>${esc(l.cls)}</td><td>${esc(l.desc)}</td></tr>`).join('')}
