@@ -36,51 +36,58 @@ async function readSheets(file) {
   return wb.SheetNames.map((name) => ({ name, rows: window.XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, raw: true, defval: '' }) }));
 }
 
+// Every report can arrive as CSV or Excel, so each file is first turned into sheets of rows
+// and then recognised by its content, not by its extension.
+async function toSheets(f, ext) {
+  if (ext === 'csv' || ext === 'tsv' || ext === 'txt') {
+    const text = await f.text();
+    return [{ name: f.name, rows: core.parseCSV(text) }];
+  }
+  return readSheets(f);
+}
+
 async function ingestAll(files) {
   setErr('');
   for (const f of files) {
     try {
       const ext = f.name.split('.').pop().toLowerCase();
       if (!f.size) { addSkipped(f.name, 'The file is empty (0 bytes). Re-export it and try again.'); continue; }
-      if (ext === 'csv') {
-        const text = await f.text();
-        const head = text.slice(0, 3000);
-        if (/Paid out/.test(head) && /Reference code/.test(head)) {
-          const p = core.parseAirbnb(text, state.cfg);
-          state.inputs.airbnb = state.inputs.airbnb.filter((x) => x.name !== f.name);
-          state.inputs.airbnb.push({ name: f.name, text, max: p.maxDate?.t ?? 0, min: p.minDate?.t ?? 0, info: `${p.payouts.length} payouts, ${p.minDate?.mdy ?? '?'} to ${p.maxDate?.mdy ?? '?'}` });
-          state.inputs.airbnb.sort((a, b) => b.max - a.max);
-          const mine = state.inputs.airbnb.find((x) => x.name === f.name);
-          const others = state.inputs.airbnb.filter((x) => x !== mine);
-          if (others.length && p.minDate && p.maxDate && others.some((x) => x.min <= p.minDate.t && x.max >= p.maxDate.t)) addSkipped(f.name, 'Loaded, but its dates are already inside another Airbnb file, so it adds nothing. Use it only for the days before the other file starts.');
-        } else if (/automatic_payout_id/.test(head)) {
-          const rows = core.parseCSV(text);
-          state.inputs.stripe = state.inputs.stripe.filter((x) => x.name !== f.name);
-          const p = core.parseStripe([{ name: f.name, rows }], state.cfg);
-          if (!p.lines.length) addSkipped(f.name, 'Stripe CSV has no charge lines. Export the payout reconciliation / itemized payouts report with its transactions.');
-          else state.inputs.stripe.push({ name: f.name, sheets: [{ name: f.name, rows }], info: `${p.payouts.length} payouts, ${p.lines.length} lines (CSV)` });
-        } else addSkipped(f.name, 'This CSV is not an Airbnb transaction history. It is also not a Stripe payouts CSV (needs automatic_payout_id). Airbnb: Earnings > Transaction history > export CSV.');
-      } else if (ext === 'xlsx' || ext === 'xls') {
-        const sheets = await readSheets(f);
-        if (sheets[0] && core.isQboRows(sheets[0].rows)) {
-          const p = core.parseQbo(sheets[0].rows, state.cfg);
-          const mine = { name: f.name, rows: sheets[0].rows, info: `${p.rows.length} ${state.cfg.incomeAccount} lines, ${p.minDate?.mdy ?? '?'} to ${p.maxDate?.mdy ?? '?'}`, max: p.maxDate?.t ?? 0, n: p.rows.length };
-          const cur = state.inputs.qbo;
-          if (!cur || mine.max > cur.max || (mine.max === cur.max && mine.n >= cur.n)) state.inputs.qbo = mine;
-          else addSkipped(f.name, 'Older QuickBooks export; the one with later dates is used');
-        } else if (core.isPnlRows(sheets[0]?.rows ?? [])) {
-          const p = core.parsePnl(sheets[0].rows, state.cfg);
-          state.inputs.pnl = { name: f.name, rows: sheets[0].rows, info: `period: ${p.period || 'unknown'}` };
-          state.tab = 'after';
-        } else if (sheets.some((s) => core.isStripeRows(s.rows))) {
-          state.inputs.stripe = state.inputs.stripe.filter((x) => x.name !== f.name);
-          const p = core.parseStripe(sheets, state.cfg);
-          state.inputs.stripe.push({ name: f.name, sheets, info: `${p.payouts.length} payouts, ${p.lines.length} lines` });
-        } else {
-          const title = sheets[0]?.rows.slice(0, 4).map((r) => r[0]).find((x) => x) ?? 'unknown report';
-          addSkipped(f.name, `Not used: this looks like "${title}". The tool needs Transaction Detail by Account (QuickBooks), Profit and Loss by Class (optional, after posting) or a Stripe payouts report.`);
-        }
-      } else addSkipped(f.name, `Cannot use a .${ext} file. Upload the Airbnb CSV and the QuickBooks/Stripe Excel (.xlsx) files.`);
+      if (!['csv', 'tsv', 'txt', 'xlsx', 'xls'].includes(ext)) { addSkipped(f.name, `Cannot use a .${ext} file. Upload CSV or Excel (.xlsx) exports.`); continue; }
+      const sheets = await toSheets(f, ext);
+      const first = sheets[0]?.rows ?? [];
+      const kind = sheets.some((s) => core.isAirbnbRows(s.rows)) ? 'airbnb'
+        : sheets.some((s) => core.isQboRows(s.rows)) ? 'qbo'
+        : sheets.some((s) => core.isStripeRows(s.rows)) ? 'stripe'
+        : core.isPnlRows(first) ? 'pnl' : null;
+      if (kind === 'airbnb') {
+        const rows = sheets.find((s) => core.isAirbnbRows(s.rows)).rows;
+        const p = core.parseAirbnb(rows, state.cfg);
+        state.inputs.airbnb = state.inputs.airbnb.filter((x) => x.name !== f.name);
+        state.inputs.airbnb.push({ name: f.name, rows, max: p.maxDate?.t ?? 0, min: p.minDate?.t ?? 0, info: `${p.payouts.length} payouts, ${p.minDate?.mdy ?? '?'} to ${p.maxDate?.mdy ?? '?'}` });
+        state.inputs.airbnb.sort((a, b) => b.max - a.max);
+        const mine = state.inputs.airbnb.find((x) => x.name === f.name);
+        const others = state.inputs.airbnb.filter((x) => x !== mine);
+        if (others.length && p.minDate && p.maxDate && others.some((x) => x.min <= p.minDate.t && x.max >= p.maxDate.t)) addSkipped(f.name, 'Loaded, but its dates are already inside another Airbnb file, so it adds nothing. Use it only for the days before the other file starts.');
+      } else if (kind === 'qbo') {
+        const rows = sheets.find((s) => core.isQboRows(s.rows)).rows;
+        const p = core.parseQbo(rows, state.cfg);
+        const mine = { name: f.name, rows, info: `${p.rows.length} ${state.cfg.incomeAccount} lines, ${p.minDate?.mdy ?? '?'} to ${p.maxDate?.mdy ?? '?'}`, max: p.maxDate?.t ?? 0, n: p.rows.length };
+        const cur = state.inputs.qbo;
+        if (!cur || mine.max > cur.max || (mine.max === cur.max && mine.n >= cur.n)) state.inputs.qbo = mine;
+        else addSkipped(f.name, 'Older QuickBooks export; the one with later dates is used');
+      } else if (kind === 'stripe') {
+        state.inputs.stripe = state.inputs.stripe.filter((x) => x.name !== f.name);
+        const p = core.parseStripe(sheets, state.cfg);
+        if (!p.lines.length) addSkipped(f.name, 'Stripe file has no charge lines. Export the payout reconciliation / itemized payouts report with its transactions.');
+        else state.inputs.stripe.push({ name: f.name, sheets, info: `${p.payouts.length} payouts, ${p.lines.length} lines` });
+      } else if (kind === 'pnl') {
+        const p = core.parsePnl(first, state.cfg);
+        state.inputs.pnl = { name: f.name, rows: first, info: `period: ${p.period || 'unknown'}` };
+        state.tab = 'after';
+      } else {
+        const title = first.slice(0, 4).map((r) => r[0]).find((x) => x) ?? 'unknown report';
+        addSkipped(f.name, `Not used: this looks like "${title}". The tool needs the Airbnb transaction history, QuickBooks Transaction Detail by Account, a Stripe payouts report, or (after posting) Profit and Loss by Class. Each can be CSV or Excel.`);
+      }
     } catch (e) { setErr(`${f.name}: ${friendlyErr(e)}`); }
   }
   state.picked = false;
@@ -127,7 +134,7 @@ function compute() {
   const { airbnb, qbo, stripe } = state.inputs;
   if (!airbnb.length || !qbo) { $('#monthsCard').hidden = true; $('#results').hidden = true; return; }
   try {
-    const a = core.mergeAirbnb(airbnb.map((x) => core.parseAirbnb(x.text, state.cfg)));
+    const a = core.mergeAirbnb(airbnb.map((x) => core.parseAirbnb(x.rows, state.cfg)));
     const q = core.parseQbo(qbo.rows, state.cfg);
     const s = stripe.length ? core.parseStripe(stripe.flatMap((x) => x.sheets), state.cfg) : null;
     state.parsed = { airbnb: a, qbo: q, stripe: s };
