@@ -44,10 +44,17 @@ Layout: `src/core.js` (all SOP logic, no DOM), `src/config.js` (default rules), 
 
 **Vercel:** import the repo, framework preset *Other*, no build command, output directory `.` (root). `vercel.json` adds security headers, including a CSP that blocks all network requests from the page.
 
-**GitHub Pages:** push to `main`, set Settings > Pages > Source to *GitHub Actions*; `.github/workflows/pages.yml` publishes the site.
+**GitHub Pages (optional):** first enable it in the repo: Settings > Pages > Build and deployment > Source = *GitHub Actions* (private repos need a paid plan). Then run Actions > *Deploy to GitHub Pages* > *Run workflow*. The workflow is manual on purpose, so a repo without Pages enabled does not show a failed run on every push; the `Get Pages site failed ... Not Found` error means Pages was not enabled yet.
 
 ## Notes
 
 - Stripe exports saved through Excel can have day and month swapped on ambiguous dates. The tool tries both readings and keeps the one that matches QuickBooks.
 - Bank statements are not read; step 8 of the SOP (checking deposits missing from QuickBooks against the statement) remains manual.
 - Never commit real exports: `.gitignore` excludes csv/xlsx files.
+
+## Prior-month Airbnb file and timing adjustments
+
+- **Optional second Airbnb upload.** Drop last month's Airbnb CSV next to this month's (the last 7 to 10 days is enough). Payouts are merged by reference code and used only to match and classify early-month deposits. They never create reclass lines; only deposits dated in the months you close are reclassified.
+- **If it is missing,** early-month deposits to a booked bank with no payout are listed as an open item ("Early-month deposits need the prior month's Airbnb file"), the matching check fails, and the run is not marked ready. They are never silently left in the booked class as passed.
+- **Timing line, one case only.** If a posted earlier-month entry (same journal prefix) already moved an amount by payout date and the deposit landed in the new month, the tool adds a timing adjustment: debit the class the earlier entry credited, credit the class it debited. It is shown on its own table (and workpaper sheet "Timing adjustments") and netted into the new month's entries. With no earlier entry for the item, the deposit is just reclassified.
+- Detection compares the earlier entry's class totals with what its own deposits explain; the leftover is matched to payouts from that month that deposited in the new month. If nothing matches, no timing line is added and an FYI is shown.
