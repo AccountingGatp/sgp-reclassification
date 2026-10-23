@@ -217,6 +217,26 @@ export function nextJournalNumber(qboRows, cfg) {
   return { next: max + 1, max, pad: Math.max(pad, cfg.journal.pad) };
 }
 
+// Numbering state. style 'series': WIRC4-001 (series = one per month closed, entry number restarts).
+// style 'sequential': WIRC-015. `used` holds every journal number already in QuickBooks so none repeat.
+export function journalNumbering(qboRows, cfg) {
+  const p = cfg.journal.prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const reSeries = new RegExp(`^${p}(\\d+)[-_ ](\\d+)$`, 'i');
+  const used = new Set(); let seriesMax = 0, last = '', lastKey = [-1, -1];
+  for (const r of qboRows) {
+    if (r.type !== 'Journal Entry' || !r.num) continue;
+    used.add(r.num.toUpperCase());
+    const m = reSeries.exec(r.num);
+    if (m) {
+      seriesMax = Math.max(seriesMax, +m[1]);
+      if (+m[1] > lastKey[0] || (+m[1] === lastKey[0] && +m[2] > lastKey[1])) { lastKey = [+m[1], +m[2]]; last = r.num; }
+    }
+  }
+  const seq = nextJournalNumber(qboRows, cfg);
+  const style = cfg.journal.style === 'sequential' ? 'sequential' : 'series';
+  return { style, used, seriesMax, seq, pad: seq.pad, last: style === 'series' ? last : (seq.max ? `${cfg.journal.prefix}${cfg.journal.separator}${String(seq.max).padStart(seq.pad, '0')}` : '') };
+}
+
 // ---------------------------------------------------------------- Stripe
 export function isStripeRows(rows) {
   return rows.slice(0, 3).some((r) => r.map(clean).includes('automatic_payout_id'));
@@ -317,7 +337,7 @@ export function monthInfo({ airbnb, qbo }) {
 }
 
 // SOP "Escalate to Jonathan and Jennifer": only these stop posting.
-export const BLOCKING = ['new-listing', 'empire-property', 'unknown-destination', 'no-tie', 'foreign'];
+export const BLOCKING = ['new-listing', 'empire-property', 'unknown-destination', 'no-tie', 'foreign', 'already-posted'];
 
 // ---------------------------------------------------------------- the SOP run
 export function analyze({ airbnb, qbo, stripe }, cfg, months) {
@@ -425,40 +445,60 @@ export function analyze({ airbnb, qbo, stripe }, cfg, months) {
   const jePat = new RegExp(`^${cfg.journal.prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'i');
   const prevMonth = (m) => { const [y, mm] = m.split('-').map(Number); return mm === 1 ? `${y - 1}-12` : `${y}-${String(mm - 1).padStart(2, '0')}`; };
   const timingWarn = [];
+  const timingNoHistory = [];
+  const jeAll = rows.filter((r) => r.type === 'Journal Entry' && jePat.test(r.num));
   for (const M of [...sel].sort()) {
     const P = prevMonth(M);
-    const jeRows = rows.filter((r) => r.type === 'Journal Entry' && r.month === P && jePat.test(r.num));
-    if (!jeRows.length) continue;
-    const strad = items.filter((it) => it.src === 'Airbnb' && !it.unmapped && it.cls
+    const strad = items.filter((it) => it.src === 'Airbnb' && !it.unmapped && it.cls && !it.timing
       && rowById0.get(it.rowId).month === M && bookedPayouts.find((p) => p.id === it.payoutId)?.date.month === P);
     if (!strad.length) continue;
-    const je = {}, dep = {}, base = {};
-    for (const r of jeRows) je[r.cls] = round2((je[r.cls] ?? 0) + r.amount);
-    for (const r of rows) if (r.month === P && r.type !== 'Journal Entry') base[r.cls] = round2((base[r.cls] ?? 0) + r.amount);
-    for (const it of items) { if (it.timing) continue; const r = rowById0.get(it.rowId); if (r.month === P) dep[it.cls] = round2((dep[it.cls] ?? 0) + it.amt); }
+    const jeRows = jeAll.filter((r) => r.month === P);
     const byCls = new Map();
     for (const it of strad) { if (!byCls.has(it.cls)) byCls.set(it.cls, []); byCls.get(it.cls).push(it); }
-    for (const [c, list] of byCls) {
-      // Amount of class c in the earlier entry that is not explained by deposits dated in that month
-      const x = round2((je[c] ?? 0) - ((dep[c] ?? 0) - (base[c] ?? 0)));
-      if (Math.abs(x) < 0.005) continue;
-      let hit = null; const n = Math.min(list.length, 14);
-      for (let mask = 1; mask < (1 << n) && !hit; mask++) {
-        let t = 0; for (let i = 0; i < n; i++) if (mask & (1 << i)) t += list[i].amt;
-        if (Math.abs(round2(t) - x) <= 0.005) hit = list.filter((_, i) => mask & (1 << i));
+    // class the earlier entry took the money out of (the debit side of the entry that credited class c)
+    const sourceOf = (rowsOfSet, c, amt) => {
+      const nums = [...new Set(rowsOfSet.filter((r) => r.cls === c && r.amount > 0 && (amt === undefined || Math.abs(r.amount - amt) < 0.005)).map((r) => r.num))];
+      const srcRow = rowsOfSet.filter((r) => nums.includes(r.num) && r.amount < 0).sort((x, y) => x.amount - y.amount)[0];
+      return { nums, from: srcRow?.cls };
+    };
+    const apply = (it, c, from, nums) => {
+      const dr = rowById0.get(it.rowId); const p = bookedPayouts.find((q) => q.id === it.payoutId);
+      if (!from || from === c) { timingWarn.push({ date: dr.date.mdy, listing: c, amount: it.amt, note: 'earlier entry found but its source class could not be identified' }); return; }
+      const t = { month: M, priorMonth: P, depositDate: dr.date.mdy, payoutDate: p.date.mdy, ref: p.ref, amount: it.amt, toClass: from, fromClass: c, trueClass: c, bookedClass: dr.cls, priorNo: nums.join(', ') };
+      timing.push(t);
+      // The earlier entry already credited class c. This month the deposit therefore moves from its booked class
+      // to the class the earlier entry took it out of, which nets the timing line into the entry.
+      it.timing = t; it.cls = from;
+    };
+    if (jeRows.length) {
+      const je = {}, dep = {}, base = {};
+      for (const r of jeRows) je[r.cls] = round2((je[r.cls] ?? 0) + r.amount);
+      for (const r of rows) if (r.month === P && r.type !== 'Journal Entry') base[r.cls] = round2((base[r.cls] ?? 0) + r.amount);
+      for (const it of items) { const r = rowById0.get(it.rowId); const k = it.timing ? it.timing.trueClass : it.cls; if (r.month === P) dep[k] = round2((dep[k] ?? 0) + it.amt); }
+      for (const [c, list] of byCls) {
+        // Amount of class c in the earlier entries that its own deposits do not explain
+        const x = round2((je[c] ?? 0) - ((dep[c] ?? 0) - (base[c] ?? 0)));
+        if (x < 0.005) continue; // only the class the earlier entry credited; the class it debited shows as the mirror image
+        let hit = null; const n = Math.min(list.length, 14);
+        for (let mask = 1; mask < (1 << n) && !hit; mask++) {
+          let t = 0; for (let i = 0; i < n; i++) if (mask & (1 << i)) t += list[i].amt;
+          if (Math.abs(round2(t) - x) <= 0.005) hit = list.filter((_, i) => mask & (1 << i));
+        }
+        if (!hit) { timingWarn.push({ date: monthEnd(P).mdy, listing: c, amount: x, note: `${P} reclass moved ${x.toFixed(2)} more than the deposits dated in ${P} explain, and no payout from ${P} deposited in ${M} adds up to it` }); continue; }
+        const { nums, from } = sourceOf(jeRows, c);
+        for (const it of hit) apply(it, c, from, nums);
       }
-      if (!hit) { timingWarn.push({ date: monthEnd(P).mdy, listing: c, amount: x, note: `${P} reclass moved ${x.toFixed(2)} more than the deposits dated in ${P} explain, and no payout from ${P} deposited in ${M} adds up to it` }); continue; }
-      // class the earlier entry took the money out of
-      const nums = [...new Set(jeRows.filter((r) => r.cls === c && r.amount > 0).map((r) => r.num))];
-      const srcRow = jeRows.filter((r) => nums.includes(r.num) && r.amount < 0).sort((a, b) => a.amount - b.amount)[0];
-      const from = srcRow?.cls;
-      for (const it of hit) {
-        const dr = rowById0.get(it.rowId); const p = bookedPayouts.find((q) => q.id === it.payoutId);
-        if (!from || from === c) { timingWarn.push({ date: dr.date.mdy, listing: c, amount: it.amt, note: 'earlier entry found but its source class could not be identified' }); continue; }
-        timing.push({ month: M, priorMonth: P, depositDate: dr.date.mdy, payoutDate: p.date.mdy, ref: p.ref, amount: it.amt, toClass: from, fromClass: c, priorNo: nums.join(', ') });
-        items.push({ rowId: it.rowId, cls: c, amt: -it.amt, src: 'timing', timing: true });
-        items.push({ rowId: it.rowId, cls: from, amt: it.amt, src: 'timing', timing: true });
-      }
+    }
+    // Fallback: the QuickBooks report does not show the earlier month, but an earlier entry elsewhere in the
+    // report has a line equal to the amount. Exact amount, credit to the true class, and a debit side.
+    for (const it of strad) {
+      if (it.timing) continue;
+      const near = jeAll.filter((r) => r.month === M || r.month === P);
+      const { nums, from } = sourceOf(near, it.cls, it.amt);
+      if (nums.length && from && from !== it.cls) apply(it, it.cls, from, nums);
+    }
+    if (!jeRows.length && strad.some((it) => !it.timing) && qbo.minDate && qbo.minDate.t > monthStart(P).t) {
+      timingNoHistory.push(...strad.filter((it) => !it.timing).map((it) => { const dr = rowById0.get(it.rowId); return { date: dr.date.mdy, listing: it.cls, amount: it.amt, ref: bookedPayouts.find((q) => q.id === it.payoutId)?.ref, note: `payout ${bookedPayouts.find((q) => q.id === it.payoutId).date.mdy} deposited ${dr.date.mdy}` }; }));
     }
   }
 
@@ -466,7 +506,13 @@ export function analyze({ airbnb, qbo, stripe }, cfg, months) {
   const classSet = new Set();
   const truth = {}, cur = {};
   const bump = (o, m, c, v) => { (o[m] ??= {}); o[m][c] = round2((o[m][c] ?? 0) + v); classSet.add(c); };
-  for (const r of rows) if (sel.has(r.month)) bump(cur, r.month, r.cls, r.amount);
+  const trueup = cfg.postedEntries === 'trueup';
+  const posted = {}; // entries already posted in the QuickBooks report, by month and class
+  for (const r of rows) {
+    if (!sel.has(r.month)) continue;
+    if (r.type === 'Journal Entry' && !trueup) { (posted[r.month] ??= {}); posted[r.month][r.cls] = round2((posted[r.month][r.cls] ?? 0) + r.amount); classSet.add(r.cls); continue; }
+    bump(cur, r.month, r.cls, r.amount);
+  }
   for (const it of items) { const r = rowById.get(it.rowId); if (sel.has(r.month)) bump(truth, r.month, it.cls, it.amt); }
   const classes = [...classSet].sort((a, b) => {
     const ia = cfg.classes.indexOf(a), ib = cfg.classes.indexOf(b);
@@ -479,27 +525,56 @@ export function analyze({ airbnb, qbo, stripe }, cfg, months) {
     for (const c of classes) adj[m][c] = round2((truth[m]?.[c] ?? 0) - (cur[m]?.[c] ?? 0));
   }
 
-  // ---- Journal entries: one per month and per source class (SOP "Journal entry and QBO import")
-  const num = nextJournalNumber(qbo.rows, cfg);
-  let n = num.next;
-  const fmtNo = () => `${cfg.journal.prefix}${cfg.journal.separator}${String(n++).padStart(num.pad, '0')}`;
+  // ---- Journal entries: one entry per month and per class pair, so each can be traced to its source
+  const numb = journalNumbering(qbo.rows, cfg);
+  const clsIdx = (c) => { const i = cfg.classes.indexOf(c); return i < 0 ? 99 : i; };
+  const srcIdx = { Airbnb: 0, Stripe: 1 };
   const journal = [];
+  const used = new Set(numb.used);
+  let series = numb.seriesMax, seqNo = numb.seq.next;
   for (const m of sortedMonths) {
-    const srcs = classes.filter((c) => adj[m][c] < -0.004).map((c) => ({ c, left: -adj[m][c] }));
-    const dsts = classes.filter((c) => adj[m][c] > 0.004).map((c) => ({ c, left: adj[m][c] }));
-    const date = monthEnd(m);
-    for (const s of srcs) {
-      const no = fmtNo();
-      const lines = [{ no, date: date.mdy, account: cfg.incomeAccount, debit: round2(s.left), credit: null, desc: `Reclass ${m} rental income out of ${s.c}`, name: '', cls: s.c }];
-      let need = s.left;
-      for (const d of dsts) {
-        if (need < 0.004) break;
-        const take = round2(Math.min(need, d.left));
-        if (take < 0.004) continue;
-        lines.push({ no, date: date.mdy, account: cfg.incomeAccount, debit: null, credit: take, desc: `Reclass ${m} rental income into ${d.c}`, name: '', cls: d.c });
-        d.left = round2(d.left - take); need = round2(need - take);
+    const pairs = new Map();
+    const addPair = (src, from, to, amt) => {
+      if (from === to || Math.abs(amt) < 0.005) return;
+      if (amt < 0) { [from, to, amt] = [to, from, -amt]; }
+      const k = [src, from, to].join('\u0001');
+      pairs.set(k, { src, from, to, amt: round2((pairs.get(k)?.amt ?? 0) + amt) });
+    };
+    if (!trueup) {
+      for (const it of items) {
+        const r = rowById.get(it.rowId);
+        if (r.month !== m || it.asBooked) continue;
+        addPair(it.src, r.cls, it.cls, it.amt);
       }
-      journal.push({ no, month: m, source: s.c, total: round2(s.left), lines });
+    } else { // re-running a month whose entries are posted: move only what is still wrong, net of those entries
+      const srcs = classes.filter((c) => adj[m][c] < -0.004).map((c) => ({ c, left: -adj[m][c] }));
+      const dsts = classes.filter((c) => adj[m][c] > 0.004).map((c) => ({ c, left: adj[m][c] }));
+      for (const sc of srcs) for (const d of dsts) {
+        const take = round2(Math.min(sc.left, d.left));
+        if (take < 0.004) continue;
+        addPair('True-up', sc.c, d.c, take); sc.left = round2(sc.left - take); d.left = round2(d.left - take);
+      }
+    }
+    const list = [...pairs.values()].filter((x) => x.amt >= 0.005)
+      .sort((a, b2) => (srcIdx[a.src] ?? 9) - (srcIdx[b2.src] ?? 9) || clsIdx(a.from) - clsIdx(b2.from) || clsIdx(a.to) - clsIdx(b2.to) || a.from.localeCompare(b2.from) || a.to.localeCompare(b2.to));
+    const date = monthEnd(m);
+    if (numb.style === 'series' && list.length) series++;
+    let n = 0;
+    for (const pr of list) {
+      let no;
+      if (numb.style === 'series') {
+        n++; no = `${cfg.journal.prefix}${series}-${String(n).padStart(cfg.journal.pad, '0')}`;
+        while (used.has(no.toUpperCase())) { series++; n = 1; no = `${cfg.journal.prefix}${series}-${String(n).padStart(cfg.journal.pad, '0')}`; }
+      } else {
+        no = `${cfg.journal.prefix}${cfg.journal.separator}${String(seqNo++).padStart(numb.pad, '0')}`;
+        while (used.has(no.toUpperCase())) no = `${cfg.journal.prefix}${cfg.journal.separator}${String(seqNo++).padStart(numb.pad, '0')}`;
+      }
+      used.add(no.toUpperCase());
+      const what = pr.src === 'True-up' ? 'true-up of earlier entries' : `${pr.src} rental income`;
+      journal.push({ no, month: m, source: pr.from, dest: pr.to, kind: pr.src, total: pr.amt, lines: [
+        { no, date: date.mdy, account: cfg.incomeAccount, debit: pr.amt, credit: null, desc: `Reclass ${m} ${what}: ${pr.from} to ${pr.to}`, name: '', cls: pr.from },
+        { no, date: date.mdy, account: cfg.incomeAccount, debit: null, credit: pr.amt, desc: `Reclass ${m} ${what}: ${pr.from} to ${pr.to}`, name: '', cls: pr.to },
+      ] });
     }
   }
 
@@ -557,7 +632,7 @@ export function analyze({ airbnb, qbo, stripe }, cfg, months) {
 
   const matchedRefs = new Set(bookedPayouts.filter((p) => p.qbo && p.ref).map((p) => p.ref.toUpperCase()));
   const knownRefs = new Set(airbnb.payouts.map((p) => p.ref.toUpperCase()).filter(Boolean));
-  const dups = [], noPayout = [], priorMissing = [], others = new Map();
+  const dups = [], noPayout = [], priorMissing = [], unsourced = [], others = new Map();
   const bookedKeys = new Set(Object.entries(cfg.destinations).filter(([, d]) => d.booked).map(([k]) => k));
   for (const r of rows) {
     if (r.used || r.type === 'Journal Entry' || !sel.has(r.month)) continue;
@@ -569,6 +644,7 @@ export function analyze({ airbnb, qbo, stripe }, cfg, months) {
       && airbnb.minDate.t >= monthStart(r.month).t && !/booking\.com|stripe/i.test(r.name + ' ' + r.desc) && !refs.some((x) => matchedRefs.has(x))) { priorMissing.push(r); continue; }
     if (refs.some((x) => matchedRefs.has(x))) dups.push(r);
     else if (/airbnb/i.test(r.name + ' ' + r.desc)) noPayout.push(r);
+    else if (r.type === 'Deposit' && !/booking\.com|stripe/i.test(r.name + ' ' + r.desc)) unsourced.push(r);
     else { const k = (r.name || '(no name)').replace(/\s*\(customer\)/i, '').toLowerCase(); if (!others.has(k)) others.set(k, []); others.get(k).push(r); }
   }
   if (dups.length) addEx({ sev: 'fix', code: 'duplicate', title: 'Duplicate deposits in QuickBooks',
@@ -577,11 +653,16 @@ export function analyze({ airbnb, qbo, stripe }, cfg, months) {
   if (priorMissing.length) addEx({ sev: 'open', code: 'prior-month-missing', title: 'Early-month deposits need the prior month\'s Airbnb file',
     detail: 'These deposits to a booked bank have no payout in the files. They are probably payouts from the end of the previous month. Upload that month\'s Airbnb CSV (the last 7 to 10 days is enough). Until then they are left in the booked class and NOT checked.',
     items: priorMissing.map((r) => ({ date: r.date.mdy, listing: r.split, amount: r.amount, note: `${r.name} (booked as ${r.cls})` })) });
+  if (timingNoHistory.length) addEx({ sev: 'open', code: 'timing-no-history', title: 'Payouts from last month deposited this month, but last month\'s journals are not in the QuickBooks report',
+    detail: 'If last month\'s entries moved these amounts by payout date, they would be counted twice. Re-run the QuickBooks report from the start of last month so the earlier entries show, then upload it again. Until then they are reclassified by deposit as normal.', items: timingNoHistory });
   if (timing.length) addEx({ sev: 'info', code: 'timing', title: `Timing adjustments (${timing.length})`,
     detail: 'An earlier posted entry already moved these amounts by payout date, but the deposit landed in the new month. The adjustment reverses the earlier move and is netted into this month\'s entries.',
     items: timing.map((t) => ({ date: t.depositDate, listing: `${t.fromClass} -> ${t.toClass}`, amount: t.amount, ref: t.ref, note: `moved by ${t.priorNo} (payout ${t.payoutDate})` })) });
   if (timingWarn.length) addEx({ sev: 'info', code: 'timing-unclear', title: 'Earlier reclass entry differs from its deposits (no timing line added)',
     detail: 'The earlier month\'s entry moved a different amount than its own deposits explain, and it does not match any payout that landed in the new month. No timing line was added. Glance at the earlier entry if you expected one.', items: timingWarn });
+  if (unsourced.length) addEx({ sev: 'open', code: 'unsourced-deposit', title: 'Deposits with no Airbnb, Stripe or Booking.com source',
+    detail: 'Nothing in the files explains these deposits, so they stay in the class they are booked in (not reclassed). Confirm with the client what they are before closing the month.',
+    items: unsourced.map((r) => ({ date: r.date.mdy, listing: r.split, amount: r.amount, note: `${r.name || '(no name)'} ${r.desc ? '- ' + r.desc : ''} (booked as ${r.cls})` })) });
   if (noPayout.length) addEx({ sev: 'open', code: 'no-payout', title: 'QuickBooks deposit with no matching payout in the files',
     detail: 'Could be a prior-month payout, a payout outside the export range, or a missing report. Left in its booked class.',
     items: noPayout.map((r) => ({ date: r.date.mdy, listing: r.split, amount: r.amount, note: r.name })) });
@@ -600,6 +681,23 @@ export function analyze({ airbnb, qbo, stripe }, cfg, months) {
   for (const m of info) open.push(`${m.month} may be incomplete: ${m.reasons.join('; ')}.`);
   for (const w of airbnb.warnings) open.push(w);
   if (open.length) addEx({ sev: 'open', code: 'coverage', title: 'Coverage warnings', detail: open.join(' '), items: [] });
+
+  // ---- Entries already posted in these months
+  if (!trueup) {
+    const pl = rows.filter((r) => r.type === 'Journal Entry' && sel.has(r.month));
+    if (pl.length) addEx({ sev: 'info', code: 'posted-entries', title: `Entries already posted in QuickBooks for the selected months (${pl.length} lines)`,
+      detail: 'Left as they are: they are not counted in "booked today" and are not corrected. If you are re-running a month whose entries are already posted and want the tool to true them up, set postedEntries to "trueup" in Rules and settings.',
+      items: pl.map((r) => ({ date: r.date.mdy, listing: r.cls, amount: r.amount, ref: r.num, note: 'posted entry line' })) });
+    for (const m of sortedMonths) {
+      const pm = posted[m]; if (!pm) continue;
+      const plan = {};
+      for (const j of journal.filter((x) => x.month === m)) for (const l of j.lines) plan[l.cls] = round2((plan[l.cls] ?? 0) + (l.credit ?? 0) - (l.debit ?? 0));
+      const keys = new Set([...Object.keys(pm), ...Object.keys(plan)]);
+      let dist = 0, size = 0; for (const k of keys) { dist += Math.abs((pm[k] ?? 0) - (plan[k] ?? 0)); size += Math.abs(pm[k] ?? 0); }
+      if (size > 0.5 && dist <= 1) addEx({ sev: 'escalate', code: 'already-posted', title: `Entries for ${m} look already posted`,
+        detail: `QuickBooks already has entries for ${m} that match what this tool would post. Posting again would double them. Remove ${m} from the selected months, or delete the earlier entries first.`, items: [] });
+    }
+  }
 
   // ---- Step 5: one summary of destination by class (excluded destinations shown but not booked)
   const ds = new Map();
@@ -636,7 +734,11 @@ export function analyze({ airbnb, qbo, stripe }, cfg, months) {
   for (const j of journal) for (const l of j.lines) { const m = j.month; post[m][l.cls] = round2((post[m][l.cls] ?? 0) + (l.credit ?? 0) - (l.debit ?? 0)); }
   let maxDiff = 0;
   for (const m of sortedMonths) for (const c of classes) maxDiff = Math.max(maxDiff, Math.abs((post[m][c] ?? 0) - (truth[m]?.[c] ?? 0)));
-  checks.push({ ok: maxDiff < 0.01, label: 'After the entries, each class equals the Airbnb/Stripe total for that class', detail: `max difference ${maxDiff.toFixed(2)}` });
+  const tot = sortedMonths.map((m) => `${m}: ` + classes.filter((c) => Math.abs(truth[m]?.[c] ?? 0) > 0.004 || Math.abs(post[m][c] ?? 0) > 0.004).map((c) => `${c} ${(post[m][c] ?? 0).toFixed(2)}`).join(', ')).join(' | ');
+  checks.push({ id: 'class-tie', ok: maxDiff <= tol + 1e-9, label: 'After the entries, each class equals the Airbnb/Stripe total for that class', detail: maxDiff <= tol + 1e-9 ? `ties. Totals after entries: ${tot}` : `DOES NOT TIE, max difference ${maxDiff.toFixed(2)}. Totals after entries: ${tot}` });
+  const allNos = journal.map((j) => j.no.toUpperCase());
+  const dupNos = allNos.filter((x, i) => allNos.indexOf(x) !== i || numb.used.has(x));
+  checks.push({ ok: dupNos.length === 0, label: 'Journal numbers are new (none repeats a number already in QuickBooks)', detail: dupNos.length ? `repeated: ${[...new Set(dupNos)].join(', ')}` : `${journal.length} new number(s)` });
   const blocking = exceptions.filter((e) => BLOCKING.includes(e.code));
   checks.push({ ok: !priorMissing.length, label: 'Early-month deposits all matched to a payout (prior-month Airbnb file loaded when needed)', detail: priorMissing.length ? `${priorMissing.length} deposit(s) have no payout. Upload last month's Airbnb file` : '' });
   checks.push({ ok: blocking.length === 0, label: 'No open escalation items', detail: blocking.length ? `${blocking.length} to resolve before posting` : '' });
@@ -644,7 +746,7 @@ export function analyze({ airbnb, qbo, stripe }, cfg, months) {
   return {
     months: sortedMonths, classes, cur, truth, adj, post, journal, exceptions, checks, destSummary,
     payouts: airbnb.payouts, bookedPayouts, items, rows, stripe: stripeResult, stripeData: stripe,
-    journalStart: num, timing, summary: {
+    journalStart: numb, timing, posted, mode: trueup ? 'trueup' : 'leave', summary: {
       payoutsBooked: bookedPayouts.length, matched: bookedPayouts.filter((p) => p.qbo).length,
       entries: journal.length, ready: checks.every((c) => c.ok),
     },
@@ -773,13 +875,13 @@ export function workpaperSheets(result) {
   const sum = [];
   for (const m of result.months) for (const c of result.classes) {
     const a = result.cur[m]?.[c] ?? 0, b = result.truth[m]?.[c] ?? 0, d = result.adj[m][c];
-    if (a || b || d) sum.push({ Month: m, Class: c, 'Booked in QBO today (incl. earlier reclass entries)': a, 'Correct per Airbnb/Stripe': b, 'Reclass needed (+credit / -debit)': d });
+    if (a || b || d) sum.push({ Month: m, Class: c, [result.mode === 'trueup' ? 'Booked in QBO today (incl. earlier reclass entries)' : 'Booked in QBO today (excl. entries already posted)']: a, 'Correct per Airbnb/Stripe': b, 'Reclass needed (+credit / -debit)': d });
   }
   sheets['Summary by month'] = sum;
   sheets['Destination x class'] = result.destSummary.map((d) => ({ Month: d.month, Destination: d.label, Status: d.status, Class: d.cls, Amount: d.amt }));
   sheets['Journal entries'] = result.journal.flatMap((j) => j.lines.map((l) => ({
     '*JournalNo': l.no, '*JournalDate': l.date, '*AccountName': l.account, Debits: l.debit ?? '', Credits: l.credit ?? '', Description: l.desc, Name: l.name, Class: l.cls })));
-  if (result.timing?.length) sheets['Timing adjustments'] = result.timing.map((t) => ({ Month: t.month, 'Deposit date': t.depositDate, 'Payout date': t.payoutDate, Reference: t.ref, Amount: t.amount, 'Debit (reverses earlier move)': t.fromClass, Credit: t.toClass, 'Earlier entry': t.priorNo, Note: 'Netted into this month\'s journal entries' }));
+  if (result.timing?.length) sheets['Timing adjustments'] = result.timing.map((t) => ({ Month: t.month, 'Deposit date': t.depositDate, 'Payout date': t.payoutDate, Reference: t.ref, Amount: t.amount, 'Booked as': t.bookedClass, 'Earlier entry moved it to': t.trueClass, 'Timing line: debit': t.fromClass, 'Timing line: credit': t.toClass, 'Net effect in this month\'s entry': `${t.bookedClass} to ${t.toClass}`, 'Earlier entry': t.priorNo, Note: 'Netted into this month\'s journal entries' }));
   sheets['Exceptions'] = result.exceptions.flatMap((e) => (e.items.length ? e.items : [{}]).map((it) => ({
     Type: e.sev, Issue: e.title, Date: it.date ?? '', 'Listing / account': it.listing ?? '', Guest: it.guest ?? '', Amount: it.amount ?? '', Reference: it.ref ?? '', Note: it.note ?? (it.date ? '' : e.detail) })));
   sheets['Checks'] = result.checks.map((c) => ({ Check: c.label, Result: c.ok ? 'Pass' : 'REVIEW', Detail: c.detail }));
