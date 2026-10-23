@@ -4,7 +4,11 @@
 
 export const DEFAULT_CONFIG = {
   incomeAccount: 'Rental Income',
-  journal: { prefix: 'WIRC', separator: '-', pad: 3 },
+  // style 'series': WIRC4-001 (one series per month closed). style 'sequential': WIRC-015.
+  journal: { prefix: 'WIRC', separator: '-', pad: 3, style: 'series' },
+  // 'leave': entries already posted in the selected months are left as they are (use for a new month).
+  // 'trueup': re-running a month that is already posted; the new entries are net of the posted ones.
+  postedEntries: 'leave',
 
   // Payout must equal the sum of its lines within this amount (SOP step 3).
   tolerance: 0.02,
