@@ -151,3 +151,61 @@ test('step 10: P&L by class after posting is compared with the correct totals', 
   const wrongPeriod = C.comparePnl(r, C.parsePnl([['x'], ['Profit and Loss'], ['January, 2025-August, 2026'], [], ['', 'A', 'B'], ['Rental Income', 1, 2]], cfg));
   assert.equal(wrongPeriod.comparable, false);
 });
+
+// ---- prior-month Airbnb file and timing adjustments ----
+const mkCsv = (rows) => [HEAD, ...rows].join('\n');
+const priorCsv = mkCsv([
+  row({ date: '08/31/2030', type: 'Payout', details: 'Transfer to Stevie Garcia, Checking 1393 (USD)', ref: 'G-PRIOR0001', paid: 300 }),
+  row({ date: '08/31/2030', type: 'Reservation', guest: 'P', listing: 'Spacious Condo | Steps to French Quarter', amt: 300 }),
+]);
+const sepCsv = mkCsv([
+  row({ date: '09/05/2030', type: 'Payout', details: 'Transfer to Stevie Garcia, Checking 1393 (USD)', ref: 'G-SEPT00001', paid: 200 }),
+  row({ date: '09/05/2030', type: 'Reservation', guest: 'S', listing: 'Wisconsin Luxury Log Mansion | Sleeps 15', amt: 200 }),
+]);
+const qh = [null, 'Transaction date', 'Transaction type', 'Num', 'Name', 'Location full name', 'Class full name', 'Description', 'Split', 'Amount', 'Balance', 'Adj'];
+const sepQbo = (withAugJe) => C.parseQbo([['Test Co'], ['Transaction Detail by Account'], ['Sept 2030'], [], qh, ['Rental Income'],
+  q('09/01/2030', 'Deposit', '', 'Airbnb', 'AIRBNB', 'Ohio Homesteading', 'CPC Checking (1393)', 300),
+  q('09/06/2030', 'Deposit', '', 'Airbnb', 'AIRBNB', 'Ohio Homesteading', 'CPC Checking (1393)', 200),
+  ...(withAugJe ? [
+    q('08/31/2030', 'Journal Entry', 'WIRC-001', '', 'Reclass', 'Cassville WI', '', -300),
+    q('08/31/2030', 'Journal Entry', 'WIRC-001', '', 'Reclass', 'NOLA', '', 300)] : []),
+  ['Total for Rental Income']], cfg);
+const air = (...t) => C.mergeAirbnb(t.map((x) => C.parseAirbnb(x, cfg)));
+const lineOf = (res, cls) => res.journal.flatMap((j) => j.lines).filter((l) => l.cls === cls).map((l) => (l.credit ?? 0) - (l.debit ?? 0)).reduce((a, b) => a + b, 0);
+
+test('prior file + earlier entry: timing line netted into the new month', () => {
+  const r = C.analyze({ airbnb: air(sepCsv, priorCsv), qbo: sepQbo(true), stripe: null }, cfg, ['2030-09']);
+  assert.equal(r.timing.length, 1);
+  assert.equal(r.timing[0].amount, 300);
+  assert.equal(r.timing[0].fromClass, 'NOLA');   // debit NOLA (reverses the earlier credit)
+  assert.equal(r.timing[0].toClass, 'Cassville WI'); // credit the class the earlier entry debited
+  assert.equal(lineOf(r, 'NOLA'), 0);
+  assert.equal(lineOf(r, 'Cassville WI'), 500);
+  assert.equal(lineOf(r, 'Ohio Homesteading'), -500);
+  assert.ok(r.checks.every((c) => c.ok || /escalation/.test(c.label)));
+});
+
+test('prior file but no earlier entry: plain reclass, no timing line', () => {
+  const r = C.analyze({ airbnb: air(sepCsv, priorCsv), qbo: sepQbo(false), stripe: null }, cfg, ['2030-09']);
+  assert.equal(r.timing.length, 0);
+  assert.equal(lineOf(r, 'NOLA'), 300);
+  assert.equal(lineOf(r, 'Cassville WI'), 200);
+});
+
+test('prior file never creates reclass lines of its own', () => {
+  const r = C.analyze({ airbnb: air(sepCsv, priorCsv), qbo: sepQbo(false), stripe: null }, cfg, ['2030-09']);
+  assert.deepEqual(r.months, ['2030-09']);
+  assert.equal(r.journal.every((j) => j.month === '2030-09'), true);
+});
+
+test('missing prior file: early deposit is an open item and the check fails', () => {
+  const r = C.analyze({ airbnb: air(sepCsv), qbo: sepQbo(false), stripe: null }, cfg, ['2030-09']);
+  assert.ok(r.exceptions.some((e) => e.code === 'prior-month-missing'));
+  assert.equal(r.checks.find((c) => /Early-month/.test(c.label)).ok, false);
+  assert.equal(r.summary.ready, false);
+});
+
+test('mergeAirbnb dedupes payouts by reference', () => {
+  const m = air(priorCsv, priorCsv, sepCsv);
+  assert.equal(m.payouts.length, 2);
+});
