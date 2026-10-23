@@ -225,3 +225,13 @@ test('diagnose: Airbnb file with no payouts', () => {
   const d = C.diagnose({ airbnb: C.parseAirbnb(HEAD, cfg), qbo: qbo(), stripe: null }, cfg);
   assert.match(d[0].msg, /no payouts/);
 });
+
+test('stripe CSV export: ISO dates, "net" column, same line in two files counted once', () => {
+  const H = ['automatic_payout_id', 'automatic_payout_effective_at', 'balance_transaction_id', 'created', 'available_on', 'currency', 'gross', 'fee', 'net', 'reporting_category', 'description'];
+  const rows = [H, ['po_1', '2030-09-09 01:36:24', 'txn_aaaaaaaaaaaaaaaa1', '', '', 'usd', '110', '10', '100', 'charge', 'Reservation #1: Ann Lee, Wisconsin Luxury Log Mansion | Sleeps 15 (123)']];
+  const s = C.parseStripe([{ name: 'a', rows }, { name: 'b', rows }], cfg);
+  assert.equal(s.lines.length, 1);
+  assert.equal(s.lines[0].net, 100);
+  assert.equal(s.lines[0].cls, 'Cassville WI');
+  assert.equal(s.payouts[0].dates.plain.mdy, '09/09/2030');
+});
