@@ -187,12 +187,14 @@ function renderResults() {
   const key = blocking.map((e) => e.code + e.title).join('|');
   if (key !== state.ackKey) { state.ackKey = key; state.ack = false; }
   const failed = r.checks.filter((c) => !c.ok && c.label !== 'No open escalation items').length;
+  const tieFail = r.checks.find((c) => c.id === 'class-tie' && !c.ok);
   const b = $('#banner');
-  if (esc2) { b.className = 'banner warn'; b.innerHTML = `<div>Stop: ${esc2} item${esc2 === 1 ? '' : 's'} to escalate before posting<small>The SOP says to ask Jonathan and Jennifer first. The import file stays locked until you confirm they have answered. ${failed ? 'A tie-out check also needs review (Checks tab).' : ''}</small></div>`; }
+  if (tieFail) { b.className = 'banner warn'; b.innerHTML = `<div>Blocked: a class does not tie to its correct total<small>${esc(tieFail.detail)}. The import file stays locked until every class ties. See the Checks and Exceptions tabs.</small></div>`; }
+  else if (esc2) { b.className = 'banner warn'; b.innerHTML = `<div>Stop: ${esc2} item${esc2 === 1 ? '' : 's'} to escalate before posting<small>The SOP says to ask Jonathan and Jennifer first. The import file stays locked until you confirm they have answered. ${failed ? 'A tie-out check also needs review (Checks tab).' : ''}</small></div>`; }
   else if (failed) { b.className = 'banner warn'; b.innerHTML = `<div>${r.journal.length} journal ${r.journal.length === 1 ? 'entry' : 'entries'} built, a tie-out check needs review<small>See the Checks and Exceptions tabs (for example duplicate deposits) before posting.</small></div>`; }
   else { b.className = 'banner ok'; b.innerHTML = `<div>${r.journal.length} journal ${r.journal.length === 1 ? 'entry' : 'entries'} ready to post<small>All tie-out checks pass. Have a second person review before posting.</small></div>`; }
   const ack = $('#ack'); ack.checked = state.ack; $('#ackWrap').hidden = !esc2;
-  $('#dlCsv').disabled = !r.journal.length || (esc2 > 0 && !state.ack);
+  $('#dlCsv').disabled = !r.journal.length || !!tieFail || (esc2 > 0 && !state.ack);
   $('#dlCsv').title = $('#dlCsv').disabled && esc2 ? 'Locked until the escalation items are answered' : '';
 
   const tabs = $('#tabs'); tabs.innerHTML = '';
@@ -210,7 +212,7 @@ function renderResults() {
 }
 
 function summary(r) {
-  let h = '<table><thead><tr><th>Month</th><th>Class</th><th class="num">Booked in QBO today</th><th class="num">Correct</th><th class="num">Reclass (+credit / -debit)</th></tr></thead><tbody>';
+  let h = '<table><thead><tr><th>Month</th><th>Class</th><th class="num">Booked in QBO today' + (r.mode === 'trueup' ? '' : ' (excl. posted entries)') + '</th><th class="num">Correct</th><th class="num">Reclass (+credit / -debit)</th></tr></thead><tbody>';
   for (const m of r.months) {
     let any = false;
     for (const c of r.classes) {
@@ -238,11 +240,11 @@ function timingBlock(r) {
 function entries(r) {
   if (!r.journal.length) return timingBlock(r) + '<p class="empty">Nothing to reclass for the selected months. Booked classes already match.</p>';
   return timingBlock(r) + r.journal.map((j) => `
-    <h3 style="margin:14px 0 6px;font-size:15px">${esc(j.no)} <span class="meta" style="color:var(--muted);font-weight:400">· ${esc(j.month)} · out of ${esc(j.source)} · ${money(j.total)}</span></h3>
+    <h3 style="margin:14px 0 6px;font-size:15px">${esc(j.no)} <span class="meta" style="color:var(--muted);font-weight:400">· ${esc(j.month)} · ${esc(j.kind)} · ${esc(j.source)} to ${esc(j.dest)} · ${money(j.total)}</span></h3>
     <table><thead><tr><th>Journal no</th><th>Date</th><th>Account</th><th class="num">Debit</th><th class="num">Credit</th><th>Class</th><th>Description</th></tr></thead><tbody>
     ${j.lines.map((l) => `<tr><td>${esc(l.no)}</td><td>${esc(l.date)}</td><td>${esc(l.account)}</td><td class="num">${money(l.debit)}</td><td class="num">${money(l.credit)}</td><td>${esc(l.cls)}</td><td>${esc(l.desc)}</td></tr>`).join('')}
     </tbody></table>`).join('') +
-    `<p class="hint" style="margin-top:12px">Numbering continues after the highest ${esc(state.cfg.journal.prefix)} entry found in QuickBooks (${r.journalStart.max ? esc(state.cfg.journal.prefix + state.cfg.journal.separator + String(r.journalStart.max).padStart(r.journalStart.pad, '0')) : 'none found'}). Debit lowers a class, credit raises it.</p>`;
+    `<p class="hint" style="margin-top:12px">One entry per month and class pair, so each traces to its source. ${state.cfg.journal.style === 'sequential' ? 'Numbers continue after' : 'Each month gets the next series after'} the highest ${esc(state.cfg.journal.prefix)} entry found in QuickBooks (${r.journalStart.last ? esc(r.journalStart.last) : 'none found'}). Debit lowers a class, credit raises it.${r.mode === 'trueup' ? ' True-up mode: entries are net of entries already posted.' : ''}</p>`;
 }
 
 function itemsTable(items) {
