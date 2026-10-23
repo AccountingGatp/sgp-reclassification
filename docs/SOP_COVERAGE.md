@@ -94,4 +94,5 @@ Stripe matching, duplicate-deposit detection, months chosen by QuickBooks deposi
 | Optional prior-month Airbnb file, matching only, no reclass lines of its own | Done (`mergeAirbnb`) |
 | Missing prior file: open item, check fails, not marked ready | Done (`prior-month-missing`) |
 | Timing line only when an earlier entry already moved the deposit; netted, shown separately | Done (`timing`) |
-| Numbering style WIRC&lt;series&gt;-001, YYYY-MM-DD dates, formula workpaper, pair-grouped entries | Not done, awaiting answers |
+| Series numbering WIRC4-001, one entry per class pair | Done |
+| YYYY-MM-DD dates, formula workpaper | Not done, awaiting answers |
