@@ -41,15 +41,19 @@ async function ingestAll(files) {
   for (const f of files) {
     try {
       const ext = f.name.split('.').pop().toLowerCase();
+      if (!f.size) { addSkipped(f.name, 'The file is empty (0 bytes). Re-export it and try again.'); continue; }
       if (ext === 'csv') {
         const text = await f.text();
         const head = text.slice(0, 3000);
         if (/Paid out/.test(head) && /Reference code/.test(head)) {
           const p = core.parseAirbnb(text, state.cfg);
           state.inputs.airbnb = state.inputs.airbnb.filter((x) => x.name !== f.name);
-          state.inputs.airbnb.push({ name: f.name, text, max: p.maxDate?.t ?? 0, info: `${p.payouts.length} payouts, ${p.minDate?.mdy ?? '?'} to ${p.maxDate?.mdy ?? '?'}` });
+          state.inputs.airbnb.push({ name: f.name, text, max: p.maxDate?.t ?? 0, min: p.minDate?.t ?? 0, info: `${p.payouts.length} payouts, ${p.minDate?.mdy ?? '?'} to ${p.maxDate?.mdy ?? '?'}` });
           state.inputs.airbnb.sort((a, b) => b.max - a.max);
-        } else addSkipped(f.name, 'CSV is not an Airbnb transaction export');
+          const mine = state.inputs.airbnb.find((x) => x.name === f.name);
+          const others = state.inputs.airbnb.filter((x) => x !== mine);
+          if (others.length && p.minDate && p.maxDate && others.some((x) => x.min <= p.minDate.t && x.max >= p.maxDate.t)) addSkipped(f.name, 'Loaded, but its dates are already inside another Airbnb file, so it adds nothing. Use it only for the days before the other file starts.');
+        } else addSkipped(f.name, 'This CSV is not an Airbnb transaction history. It needs the columns "Paid out" and "Reference code". In Airbnb: Earnings > Transaction history > export CSV.');
       } else if (ext === 'xlsx' || ext === 'xls') {
         const sheets = await readSheets(f);
         if (sheets[0] && core.isQboRows(sheets[0].rows)) {
@@ -68,15 +72,21 @@ async function ingestAll(files) {
           state.inputs.stripe.push({ name: f.name, sheets, info: `${p.payouts.length} payouts, ${p.lines.length} lines` });
         } else {
           const title = sheets[0]?.rows.slice(0, 4).map((r) => r[0]).find((x) => x) ?? 'unknown report';
-          addSkipped(f.name, `Not needed (${title})`);
+          addSkipped(f.name, `Not used: this looks like "${title}". The tool needs Transaction Detail by Account (QuickBooks), Profit and Loss by Class (optional, after posting) or a Stripe payouts report.`);
         }
-      } else addSkipped(f.name, 'Unsupported file type');
-    } catch (e) { setErr(`${f.name}: ${e.message}`); }
+      } else addSkipped(f.name, `Cannot use a .${ext} file. Upload the Airbnb CSV and the QuickBooks/Stripe Excel (.xlsx) files.`);
+    } catch (e) { setErr(`${f.name}: ${friendlyErr(e)}`); }
   }
   state.picked = false;
   compute();
 }
 
+function friendlyErr(e) {
+  const m = String(e.message || e);
+  if (/password|encrypt/i.test(m)) return 'The file is password protected. Remove the password and export it again.';
+  if (/zip|corrupt|central directory|unsupported file|bad compressed|invalid|End of data/i.test(m)) return 'The file could not be opened. It may be damaged or not a real Excel file. Re-download it from QuickBooks/Stripe and try again.';
+  return m;
+}
 const skipped = [];
 function addSkipped(name, note) { skipped.push({ name, note }); }
 function setErr(m) { const el = $('#loaderr'); el.textContent = m; el.hidden = !m; }
@@ -106,7 +116,8 @@ function fileRow(kind, label, name, info, onRemove) {
 function compute() {
   setErr('');
   renderFiles();
-  state.result = null;
+  state.result = null; state.problems = [];
+  renderProblems();
   const { airbnb, qbo, stripe } = state.inputs;
   if (!airbnb.length || !qbo) { $('#monthsCard').hidden = true; $('#results').hidden = true; return; }
   try {
@@ -114,6 +125,9 @@ function compute() {
     const q = core.parseQbo(qbo.rows, state.cfg);
     const s = stripe.length ? core.parseStripe(stripe.flatMap((x) => x.sheets), state.cfg) : null;
     state.parsed = { airbnb: a, qbo: q, stripe: s };
+    state.problems = core.diagnose(state.parsed, state.cfg);
+    renderProblems();
+    if (state.problems.some((x) => x.level === 'error')) { $('#monthsCard').hidden = true; $('#results').hidden = true; return; }
     state.monthList = core.monthInfo(state.parsed);
     if (!state.picked) { state.months = new Set(state.monthList.filter((m) => m.complete).map((m) => m.month)); state.picked = true; }
     state.months = new Set([...state.months].filter((m) => state.monthList.some((x) => x.month === m)));
@@ -124,9 +138,17 @@ function compute() {
 
 function run() {
   if (!state.parsed) return;
-  if (!state.months.size) { state.result = null; $('#results').hidden = true; return; }
+  if (!state.months.size) { state.result = null; $('#results').hidden = true; renderProblems([{ level: 'warn', msg: 'No month is ticked. Tick at least one month above. Months marked incomplete need a fuller export first.' }]); return; }
   state.result = core.analyze(state.parsed, state.cfg, [...state.months]);
+  renderProblems(core.diagnoseResult(state.result));
   renderResults();
+}
+
+function renderProblems(extra = []) {
+  let el = document.querySelector('#problems');
+  if (!el) { el = document.createElement('div'); el.id = 'problems'; el.setAttribute('role', 'alert'); $('#files').after(el); }
+  const all = [...(state.problems ?? []), ...extra];
+  el.innerHTML = all.map((p) => `<p class="${p.level === 'error' ? 'err' : 'hint'}" style="margin:8px 0">${p.level === 'error' ? 'Problem: ' : p.level === 'warn' ? 'Check: ' : 'Note: '}${esc(p.msg)}</p>`).join('');
 }
 
 function renderMonths() {
