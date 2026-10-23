@@ -235,3 +235,14 @@ test('stripe CSV export: ISO dates, "net" column, same line in two files counted
   assert.equal(s.lines[0].cls, 'Cassville WI');
   assert.equal(s.payouts[0].dates.plain.mdy, '09/09/2030');
 });
+
+test('same report works as Excel rows: serial dates, numbers, title rows above the header', () => {
+  const ser = (m, d) => Date.UTC(2030, m - 1, d) / 86400000 + 25569;
+  const rows = [['Transaction history'], [], C.parseCSV(HEAD)[0],
+    ...C.parseCSV(csv).slice(1).map((r) => { const o = [...r]; o[0] = ser(...r[0].split('/').slice(0, 2).map(Number)); o[13] = r[13] === '' ? '' : Number(r[13]); o[14] = r[14] === '' ? '' : Number(r[14]); return o; })];
+  assert.equal(C.isAirbnbRows(rows), true);
+  const a = C.parseAirbnb(rows, cfg), b = C.parseAirbnb(csv, cfg);
+  assert.equal(a.payouts.length, b.payouts.length);
+  assert.equal(a.payouts[0].date.mdy, b.payouts[0].date.mdy);
+  assert.equal(a.payouts.every((p) => p.ties), true);
+});
