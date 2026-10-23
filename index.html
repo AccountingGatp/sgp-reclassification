@@ -24,8 +24,8 @@
       <h2 id="s1"><span class="step">1</span> Add this month's exports</h2>
       <div id="drop" class="drop" tabindex="0" role="button" aria-label="Choose files or drop them here">
         <span><strong>Drop all the files here</strong> or <u>choose files</u></span>
-        <small>Airbnb transaction CSV (add last month's CSV too, the last 7 to 10 days is enough, so early-month deposits can be matched), QuickBooks Transaction Detail by Account (.xlsx), Stripe payouts report (.xlsx or .csv, optional). Other QuickBooks reports are ignored.</small>
-        <input id="file" type="file" multiple accept=".csv,.xlsx,.xls" hidden>
+        <small>Airbnb transaction CSV (add last month's CSV too, the last 7 to 10 days is enough, so early-month deposits can be matched), QuickBooks Transaction Detail by Account, Stripe payouts report (optional). Every file can be CSV or Excel. Other reports are ignored.</small>
+        <input id="file" type="file" multiple accept=".csv,.xlsx,.xls,.tsv,.txt" hidden>
       </div>
       <ul id="files" class="files" aria-live="polite"></ul>
       <p id="loaderr" class="err" role="alert" hidden></p>
