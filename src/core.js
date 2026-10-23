@@ -23,8 +23,15 @@ export function mkDate(y, m, d) {
   return { y, m, d, t: t / DAY, iso: `${y}-${pad(m)}-${pad(d)}`, month: `${y}-${pad(m)}`, mdy: `${pad(m)}/${pad(d)}/${y}` };
 }
 export function parseMDY(s) {
-  const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})/.exec(clean(s));
-  return m ? mkDate(+m[3], +m[1], +m[2]) : null;
+  // Accepts MM/DD/YYYY text, YYYY-MM-DD text, a real Date, or an Excel serial number
+  // (so the same report works whether it arrives as CSV or Excel).
+  if (typeof s === 'number') return s > 20000 && s < 80000 ? fromSerial(s) : null;
+  if (s instanceof Date) return mkDate(s.getFullYear(), s.getMonth() + 1, s.getDate());
+  const t = clean(s);
+  const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})/.exec(t);
+  if (m) return mkDate(+m[3], +m[1], +m[2]);
+  const i = /^(\d{4})-(\d{2})-(\d{2})/.exec(t);
+  return i ? mkDate(+i[1], +i[2], +i[3]) : null;
 }
 function parseDMY(s) {
   const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})/.exec(clean(s));
@@ -75,9 +82,16 @@ function destinationOf(details, cfg) {
 }
 
 // ---------------------------------------------------------------- Airbnb CSV
-export function parseAirbnb(text, cfg) {
-  const rows = parseCSV(text);
-  if (!rows.length) throw new Error('The Airbnb file is empty.');
+export function isAirbnbRows(rows) {
+  return rows.slice(0, 6).some((r) => { const h = r.map(clean); return h.includes('Paid out') && h.includes('Reference code'); });
+}
+// input: CSV text, or rows (array of arrays) read from an Excel sheet
+export function parseAirbnb(input, cfg) {
+  const all = typeof input === 'string' ? parseCSV(input) : input;
+  if (!all.length) throw new Error('The Airbnb file is empty.');
+  let hi = all.slice(0, 6).findIndex((r) => r.map(clean).includes('Reference code'));
+  if (hi < 0) hi = 0;
+  const rows = all.slice(hi);
   const header = rows[0].map(clean);
   const ix = (n) => header.indexOf(n);
   const need = ['Date', 'Type', 'Listing', 'Details', 'Reference code', 'Currency', 'Amount', 'Paid out'];
@@ -98,7 +112,7 @@ export function parseAirbnb(text, cfg) {
       curP = {
         id: payouts.length, date, ref: clean(r[ix('Reference code')]), details,
         destKey: destKey ?? 'UNKNOWN', destLabel: dest?.label ?? details, booked: !!dest?.booked,
-        dest, paid: toNumber(r[ix('Paid out')]) ?? 0, lines: [], row: i + 2,
+        dest, paid: toNumber(r[ix('Paid out')]) ?? 0, lines: [], row: i + 2 + hi,
         arriving: ix('Arriving by date') >= 0 ? parseMDY(r[ix('Arriving by date')]) : null,
       };
       payouts.push(curP);
@@ -107,10 +121,10 @@ export function parseAirbnb(text, cfg) {
       curP.lines.push({
         date, type, listing, guest: clean(r[ix('Guest')]), code: clean(r[ix('Confirmation Code')]),
         currency: clean(r[ix('Currency')]) || 'USD', amount: toNumber(r[ix('Amount')]) ?? 0,
-        cls: classify(listing), row: i + 2,
+        cls: classify(listing), row: i + 2 + hi,
       });
     } else {
-      warnings.push(`Row ${i + 2} (${type}) appears before any Payout row and was ignored.`);
+      warnings.push(`Row ${i + 2 + hi} (${type}) appears before any Payout row and was ignored.`);
     }
   });
   const tol = cfg.tolerance;
