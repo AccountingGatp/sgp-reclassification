@@ -53,7 +53,13 @@ async function ingestAll(files) {
           const mine = state.inputs.airbnb.find((x) => x.name === f.name);
           const others = state.inputs.airbnb.filter((x) => x !== mine);
           if (others.length && p.minDate && p.maxDate && others.some((x) => x.min <= p.minDate.t && x.max >= p.maxDate.t)) addSkipped(f.name, 'Loaded, but its dates are already inside another Airbnb file, so it adds nothing. Use it only for the days before the other file starts.');
-        } else addSkipped(f.name, 'This CSV is not an Airbnb transaction history. It needs the columns "Paid out" and "Reference code". In Airbnb: Earnings > Transaction history > export CSV.');
+        } else if (/automatic_payout_id/.test(head)) {
+          const rows = core.parseCSV(text);
+          state.inputs.stripe = state.inputs.stripe.filter((x) => x.name !== f.name);
+          const p = core.parseStripe([{ name: f.name, rows }], state.cfg);
+          if (!p.lines.length) addSkipped(f.name, 'Stripe CSV has no charge lines. Export the payout reconciliation / itemized payouts report with its transactions.');
+          else state.inputs.stripe.push({ name: f.name, sheets: [{ name: f.name, rows }], info: `${p.payouts.length} payouts, ${p.lines.length} lines (CSV)` });
+        } else addSkipped(f.name, 'This CSV is not an Airbnb transaction history. It is also not a Stripe payouts CSV (needs automatic_payout_id). Airbnb: Earnings > Transaction history > export CSV.');
       } else if (ext === 'xlsx' || ext === 'xls') {
         const sheets = await readSheets(f);
         if (sheets[0] && core.isQboRows(sheets[0].rows)) {
