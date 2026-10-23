@@ -631,6 +631,44 @@ export function analyze({ airbnb, qbo, stripe }, cfg, months) {
   };
 }
 
+// ---------------------------------------------------------------- plain-language problems
+// level 'error': results are not shown until fixed. level 'warn': shown above the results.
+export function diagnose({ airbnb, qbo, stripe }, cfg) {
+  const out = [];
+  const range = (a, b) => (a && b ? `${a.mdy} to ${b.mdy}` : 'unknown dates');
+  if (!airbnb.payouts.length) out.push({ level: 'error', msg: 'The Airbnb file has no payouts in it. In Airbnb go to Earnings > Transaction history, choose all transaction types and the full date range, then export CSV.' });
+  if (!qbo.rows.length) out.push({ level: 'error', msg: `The QuickBooks report has no "${cfg.incomeAccount}" lines. Run Transaction Detail by Account for the period with the ${cfg.incomeAccount} account included.` });
+  if (out.some((o) => o.level === 'error')) return out;
+  const booked = airbnb.payouts.filter((p) => p.booked);
+  if (!booked.length) out.push({ level: 'error', msg: `None of the Airbnb payouts go to a booked account (${Object.entries(cfg.destinations).filter(([, d]) => d.booked).map(([k]) => k).join(', ')}). Check you used the right Airbnb account, or add the account in Rules and settings.` });
+  const slack = 20;
+  if (airbnb.minDate && qbo.minDate && (airbnb.maxDate.t + slack < qbo.minDate.t || qbo.maxDate.t + slack < airbnb.minDate.t)) {
+    out.push({ level: 'error', msg: `The files are from different periods. Airbnb covers ${range(airbnb.minDate, airbnb.maxDate)} but QuickBooks covers ${range(qbo.minDate, qbo.maxDate)}. Check you did not pick the wrong year or month, then upload matching files.` });
+    return out;
+  }
+  if (airbnb.maxDate && qbo.maxDate && airbnb.maxDate.t < qbo.maxDate.t - 30) out.push({ level: 'warn', msg: `The Airbnb file ends ${airbnb.maxDate.mdy} but QuickBooks runs to ${qbo.maxDate.mdy}. Months after the Airbnb end date are marked incomplete and cannot be reclassed until you export Airbnb through month end.` });
+  if (airbnb.maxDate && qbo.maxDate && qbo.maxDate.t < airbnb.maxDate.t - 30) out.push({ level: 'warn', msg: `QuickBooks ends ${qbo.maxDate.mdy} but Airbnb runs to ${airbnb.maxDate.mdy}. Re-run the QuickBooks report through month end.` });
+  if (airbnb.truncationRisk) out.push({ level: 'warn', msg: `The Airbnb file has ${airbnb.rowCount} rows. Airbnb stops exports at about 1,000 rows, so the end may be cut off. Export a shorter date range if a month looks short.` });
+  const bad = airbnb.payouts.filter((p) => !p.date);
+  if (bad.length) out.push({ level: 'warn', msg: `${bad.length} payout row(s) have a date the tool could not read and are ignored (first one is row ${bad[0].row}). Dates must look like MM/DD/YYYY.` });
+  if (stripe) {
+    const sd = stripe.payouts.map((p) => p.dates?.plain).filter(Boolean).sort((a, b) => a.t - b.t);
+    if (sd.length && qbo.minDate && (sd[sd.length - 1].t + 45 < qbo.minDate.t || sd[0].t - 45 > qbo.maxDate.t)) out.push({ level: 'warn', msg: `The Stripe report dates (${range(sd[0], sd[sd.length - 1])}) do not overlap QuickBooks (${range(qbo.minDate, qbo.maxDate)}). It may be the wrong year, so it is unlikely to match.` });
+  }
+  return out;
+}
+
+// Problems that only show once the run is done.
+export function diagnoseResult(result) {
+  const out = [];
+  const inRange = result.bookedPayouts.filter((p) => result.months.includes(p.date.month));
+  const matched = inRange.filter((p) => p.qbo).length;
+  if (inRange.length >= 3 && matched / inRange.length < 0.5) out.push({ level: 'warn', msg: `Only ${matched} of ${inRange.length} Airbnb payouts in the selected months were found in QuickBooks. The files may be for different accounts or years, or the deposits are not booked to Rental Income. Check before posting.` });
+  if (result.stripeData && result.stripe && !result.stripe.matches.some((m) => m.mode !== 'none')) out.push({ level: 'warn', msg: 'None of the Stripe payouts were found in QuickBooks, so Stripe income was not reclassed. Check the Stripe report is for the same period.' });
+  if (!result.journal.length && result.summary.matched > 0) out.push({ level: 'info', msg: 'Nothing to reclass for the selected months: the booked classes already match Airbnb/Stripe.' });
+  return out;
+}
+
 // ---------------------------------------------------------------- outputs
 export function journalCsv(result) {
   const head = ['*JournalNo', '*JournalDate', '*AccountName', 'Debits', 'Credits', 'Description', 'Name', 'Class'];
