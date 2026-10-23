@@ -220,29 +220,35 @@ function stripeDateCandidates(cell) {
     const d = mkDate(cell.getFullYear(), cell.getMonth() + 1, cell.getDate());
     return { plain: d, swapped: mkDate(d.y, d.d, d.m) ?? d, ambiguous: true };
   }
+  const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(clean(cell)); // Stripe CSV: 2026-09-09 01:36:24
+  if (iso) { const di = mkDate(+iso[1], +iso[2], +iso[3]); if (di) return { plain: di, swapped: di, ambiguous: false }; }
   const d = parseDMY(cell);
   return d ? { plain: d, swapped: d, ambiguous: false } : null;
 }
 
 export function parseStripe(sheets, cfg) {
   const classify = listingClassifier(cfg);
-  const lines = [];
+  const lines = []; const seenBt = new Set();
   for (const { name, rows } of sheets) {
     const hi = rows.findIndex((r) => r.map(clean).includes('automatic_payout_id'));
     if (hi < 0) continue;
     const head = rows[hi].map(clean);
     const ix = (n) => head.indexOf(n);
+    const netCol = head.indexOf('net (paid out)') >= 0 ? 'net (paid out)' : 'net'; // xlsx report vs CSV export
     for (let i = hi + 1; i < rows.length; i++) {
       const r = rows[i];
       const id = clean(r[ix('automatic_payout_id')]);
       if (!id) continue;
+      const bt = clean(r[ix('balance_transaction_id')]);
+      if (bt && seenBt.has(bt)) continue; // same line in two uploaded files
+      if (bt) seenBt.add(bt);
       const cat = clean(r[ix('reporting_category')]);
       if (cat === 'payout') continue; // payout summary rows duplicate the lines
       const desc = clean(r[ix('description')]);
       lines.push({
         sheet: name, payoutId: id, dates: stripeDateCandidates(r[ix('automatic_payout_effective_at')]),
         btxn: clean(r[ix('balance_transaction_id')]), cat, gross: toNumber(r[ix('gross')]) ?? 0,
-        net: toNumber(r[ix('net (paid out)')]) ?? 0, desc, cls: null, listing: stripeListing(desc), guest: stripeGuest(desc),
+        net: toNumber(r[ix(netCol)]) ?? 0, desc, cls: null, listing: stripeListing(desc), guest: stripeGuest(desc),
       });
     }
   }
