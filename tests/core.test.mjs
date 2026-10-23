@@ -209,3 +209,19 @@ test('mergeAirbnb dedupes payouts by reference', () => {
   const m = air(priorCsv, priorCsv, sepCsv);
   assert.equal(m.payouts.length, 2);
 });
+
+// ---- plain-language problems ----
+test('diagnose: files from different years give a clear error', () => {
+  const a = C.parseAirbnb(csv.replaceAll('2030', '2025'), cfg);
+  const d = C.diagnose({ airbnb: a, qbo: qbo(), stripe: null }, cfg);
+  assert.equal(d[0].level, 'error');
+  assert.match(d[0].msg, /different periods/);
+});
+test('diagnose: matching files raise no error', () => {
+  const d = C.diagnose({ airbnb: C.parseAirbnb(csv, cfg), qbo: qbo(), stripe: null }, cfg);
+  assert.equal(d.some((x) => x.level === 'error'), false);
+});
+test('diagnose: Airbnb file with no payouts', () => {
+  const d = C.diagnose({ airbnb: C.parseAirbnb(HEAD, cfg), qbo: qbo(), stripe: null }, cfg);
+  assert.match(d[0].msg, /no payouts/);
+});
