@@ -52,10 +52,13 @@ test('listing match ignores spacing around pipes', () => {
   assert.equal(a.payouts[1].lines[0].cls, 'Ohio Homesteading');
 });
 
-test('end to end: NOLA split out of Cassville, next journal number, escalations', () => {
-  const airbnb = C.parseAirbnb(csv, cfg);
-  const r = C.analyze({ airbnb, qbo: qbo(), stripe: null }, cfg, ['2030-03']);
-  assert.equal(r.journalStart.next, 4);
+// Re-running a month whose entries are posted: true-up mode and WIRC-015 style numbering
+const cfgTrue = { ...cfg, postedEntries: 'trueup', journal: { ...cfg.journal, style: 'sequential' } };
+
+test('end to end (true-up mode): NOLA split out of Cassville, next journal number, escalations', () => {
+  const airbnb = C.parseAirbnb(csv, cfgTrue);
+  const r = C.analyze({ airbnb, qbo: qbo(), stripe: null }, cfgTrue, ['2030-03']);
+  assert.equal(r.journalStart.seq.next, 4);
   assert.equal(r.journal.length, 1);
   const j = r.journal[0];
   assert.equal(j.no, 'WIRC-004');
@@ -72,8 +75,8 @@ test('end to end: NOLA split out of Cassville, next journal number, escalations'
 });
 
 test('csv export: both lines share the journal number, debit and credit on the right sides', () => {
-  const airbnb = C.parseAirbnb(csv, cfg);
-  const r = C.analyze({ airbnb, qbo: qbo(), stripe: null }, cfg, ['2030-03']);
+  const airbnb = C.parseAirbnb(csv, cfgTrue);
+  const r = C.analyze({ airbnb, qbo: qbo(), stripe: null }, cfgTrue, ['2030-03']);
   const lines = C.journalCsv(r).trim().split(/\r?\n/);
   assert.equal(lines[0], '*JournalNo,*JournalDate,*AccountName,Debits,Credits,Description,Name,Class');
   assert.match(lines[1], /^WIRC-004,03\/31\/2030,Rental Income,450,,.*Cassville WI$/);
@@ -245,4 +248,85 @@ test('same report works as Excel rows: serial dates, numbers, title rows above t
   assert.equal(a.payouts.length, b.payouts.length);
   assert.equal(a.payouts[0].date.mdy, b.payouts[0].date.mdy);
   assert.equal(a.payouts.every((p) => p.ties), true);
+});
+
+// ---- one entry per class pair, series numbering, personal -> Ohio, honest checks ----
+test('default mode: one entry per class pair, series numbering, posted entries left as is', () => {
+  const r = C.analyze({ airbnb: C.parseAirbnb(csv, cfg), qbo: qbo(), stripe: null }, cfg, ['2030-03']);
+  assert.deepEqual(r.journal.map((j) => [j.no, j.source, j.dest, j.total]),
+    [['WIRC1-001', 'Ohio Homesteading', 'Cassville WI', 1000], ['WIRC1-002', 'Ohio Homesteading', 'NOLA', 450]]);
+  assert.equal(r.journal[0].lines[0].debit, 1000);
+  assert.equal(r.journal[0].lines[1].credit, 1000);
+  assert.ok(r.exceptions.some((e) => e.code === 'posted-entries'));
+  assert.ok(r.checks.find((c) => c.id === 'class-tie').ok);
+});
+
+test('series continues after the highest existing series and never repeats a used number', () => {
+  const rows = [['Test Co'], ['Transaction Detail by Account'], ['x'], [], qhead, ['Rental Income'],
+    q('03/11/2030', 'Deposit', '', 'Airbnb', 'AIRBNB G-AAAAAAAA1', 'Ohio Homesteading', 'CPC Checking (1393)', 1450),
+    q('02/28/2030', 'Journal Entry', 'WIRC3-001', '', 'Reclass', 'Ohio Homesteading', '', -10),
+    q('02/28/2030', 'Journal Entry', 'WIRC3-001', '', 'Reclass', 'NOLA', '', 10),
+    ['Total for Rental Income']];
+  const r = C.analyze({ airbnb: C.parseAirbnb(csv, cfg), qbo: C.parseQbo(rows, cfg), stripe: null }, cfg, ['2030-03']);
+  assert.deepEqual(r.journal.map((j) => j.no), ['WIRC4-001', 'WIRC4-002']);
+  assert.ok(r.checks.find((c) => /Journal numbers are new/.test(c.label)).ok);
+});
+
+test('Personal / Non-Property deposit with Ohio listings: its own Personal -> Ohio entry, not netted into others', () => {
+  const rows = [['Test Co'], ['Transaction Detail by Account'], ['x'], [], qhead, ['Rental Income'],
+    q('03/13/2030', 'Deposit', '', 'Airbnb', 'AIRBNB G-BBBBBBBB2', 'Personal / Non-Property', 'Chase Complete Checking (2665)', 300),
+    q('03/11/2030', 'Deposit', '', 'Airbnb', 'AIRBNB G-AAAAAAAA1', 'Ohio Homesteading', 'CPC Checking (1393)', 1450),
+    ['Total for Rental Income']];
+  const r = C.analyze({ airbnb: C.parseAirbnb(csv, cfg), qbo: C.parseQbo(rows, cfg), stripe: null }, cfg, ['2030-03']);
+  const pe = r.journal.find((j) => j.source === 'Personal / Non-Property');
+  assert.equal(pe.dest, 'Ohio Homesteading');
+  assert.equal(pe.total, 200); // the 100 unmapped listing stays where it was booked
+  assert.equal(r.journal.filter((j) => j.source === 'Ohio Homesteading').every((j) => j.dest !== 'Personal / Non-Property'), true);
+});
+
+test('unsourced deposit is listed as an open item and stays in its class', () => {
+  const rows = [['Test Co'], ['Transaction Detail by Account'], ['x'], [], qhead, ['Rental Income'],
+    q('03/11/2030', 'Deposit', '', 'Airbnb', 'AIRBNB G-AAAAAAAA1', 'Ohio Homesteading', 'CPC Checking (1393)', 1450),
+    q('03/20/2030', 'Deposit', '', '', 'REMOTE ONLINE DEPOSIT', 'Personal / Non-Property', 'CPC Checking (1393)', 3192.16),
+    ['Total for Rental Income']];
+  const r = C.analyze({ airbnb: C.parseAirbnb(csv, cfg), qbo: C.parseQbo(rows, cfg), stripe: null }, cfg, ['2030-03']);
+  assert.ok(r.exceptions.some((e) => e.code === 'unsourced-deposit'));
+  assert.equal(r.post['2030-03']['Personal / Non-Property'], 3192.16);
+});
+
+test('timing: the earlier-entry amount lands in the Ohio -> Cassville entry, as a separate timing record', () => {
+  const r = C.analyze({ airbnb: air(sepCsv, priorCsv), qbo: sepQbo(true), stripe: null }, cfg, ['2030-09']);
+  assert.deepEqual(r.journal.map((j) => [j.source, j.dest, j.total]), [['Ohio Homesteading', 'Cassville WI', 500]]);
+  assert.equal(r.timing[0].trueClass, 'NOLA');
+  assert.equal(r.timing[0].bookedClass, 'Ohio Homesteading');
+});
+
+test('entries already posted for the same month are flagged as a possible double post', () => {
+  const rows = [['Test Co'], ['Transaction Detail by Account'], ['x'], [], qhead, ['Rental Income'],
+    q('03/11/2030', 'Deposit', '', 'Airbnb', 'AIRBNB G-AAAAAAAA1', 'Ohio Homesteading', 'CPC Checking (1393)', 1450),
+    q('03/31/2030', 'Journal Entry', 'WIRC1-001', '', 'Reclass', 'Ohio Homesteading', '', -1000),
+    q('03/31/2030', 'Journal Entry', 'WIRC1-001', '', 'Reclass', 'Cassville WI', '', 1000),
+    q('03/31/2030', 'Journal Entry', 'WIRC1-002', '', 'Reclass', 'Ohio Homesteading', '', -450),
+    q('03/31/2030', 'Journal Entry', 'WIRC1-002', '', 'Reclass', 'NOLA', '', 450),
+    ['Total for Rental Income']];
+  const r = C.analyze({ airbnb: C.parseAirbnb(csv, cfg), qbo: C.parseQbo(rows, cfg), stripe: null }, cfg, ['2030-03']);
+  assert.ok(r.exceptions.some((e) => e.code === 'already-posted'));
+});
+
+test('timing is also found when the earlier entry is dated in the new month (report starts later)', () => {
+  const rows = [['Test Co'], ['Transaction Detail by Account'], ['x'], [], qh, ['Rental Income'],
+    q('09/01/2030', 'Deposit', '', 'Airbnb', 'AIRBNB', 'Ohio Homesteading', 'CPC Checking (1393)', 300),
+    q('09/06/2030', 'Deposit', '', 'Airbnb', 'AIRBNB', 'Ohio Homesteading', 'CPC Checking (1393)', 200),
+    q('09/01/2030', 'Journal Entry', 'WIRC3-001', '', 'Reclass', 'Cassville WI', '', -300),
+    q('09/01/2030', 'Journal Entry', 'WIRC3-001', '', 'Reclass', 'NOLA', '', 300),
+    ['Total for Rental Income']];
+  const r = C.analyze({ airbnb: air(sepCsv, priorCsv), qbo: C.parseQbo(rows, cfg), stripe: null }, cfg, ['2030-09']);
+  assert.equal(r.timing.length, 1);
+  assert.deepEqual(r.journal.map((j) => [j.no, j.source, j.dest, j.total]), [['WIRC4-001', 'Ohio Homesteading', 'Cassville WI', 500]]);
+});
+
+test('no earlier journal visible: no timing line, but a warning that last month is missing from the report', () => {
+  const r = C.analyze({ airbnb: air(sepCsv, priorCsv), qbo: sepQbo(false), stripe: null }, cfg, ['2030-09']);
+  assert.equal(r.timing.length, 0);
+  assert.ok(r.exceptions.some((e) => e.code === 'timing-no-history'));
 });
